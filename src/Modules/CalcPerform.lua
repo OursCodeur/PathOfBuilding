@@ -20,6 +20,16 @@ local bor = bit.bor
 local band = bit.band
 local bnot = bit.bnot
 
+local function isCalculatorLikeMode(mode)
+	return mode == "CALCULATOR" or mode == "REPORT"
+end
+
+local function getReportContext(env)
+	if env.mode == "REPORT" then
+		return env.reportContext
+	end
+end
+
 --- getCachedOutputValue
 ---  retrieves a value specified by key from a cached version of skill
 ---  specified by @uuid or if not found in cache computes teh cache.
@@ -29,7 +39,7 @@ local bnot = bit.bnot
 --- @return table unpacked table containing the desired values
 local function getCachedOutputValue(env, activeSkill, ...)
 	local uuid = cacheSkillUUID(activeSkill, env)
-	if not GlobalCache.cachedData[env.mode][uuid] or env.mode == "CALCULATOR" then
+	if not GlobalCache.cachedData[env.mode][uuid] or isCalculatorLikeMode(env.mode) then
 		calcs.buildActiveSkill(env, env.mode, activeSkill, uuid, {uuid})
 	end
 
@@ -63,6 +73,171 @@ local function mergeBuff(src, destTable, destKey)
 			t_insert(dest, mod)
 		end
 	end
+end
+
+local function resetActiveSkillTransientState(activeSkill)
+	activeSkill.buffSkill = nil
+	activeSkill.minionBuffSkill = nil
+	activeSkill.totemBuffSkill = nil
+	activeSkill.debuffSkill = nil
+	activeSkill.infoMessage = nil
+	activeSkill.infoMessage2 = nil
+	activeSkill.infoTrigger = nil
+	if activeSkill.mirage then
+		activeSkill.mirage.infoMessage = nil
+		activeSkill.mirage.infoMessage2 = nil
+		activeSkill.mirage.infoTrigger = nil
+		activeSkill.mirage.skillPartName = nil
+	end
+end
+
+local function prepareActiveSkillsForPerform(env, skipEHP)
+	local reportContext = getReportContext(env)
+	local reuseReportDefenceOnly = reportContext and not reportContext.needsOffence
+	-- Build minion skills
+	for _, activeSkill in ipairs(env.player.activeSkillList) do
+		resetActiveSkillTransientState(activeSkill)
+		if not activeSkill.basePerformSkillData then
+			activeSkill.basePerformSkillData = copyTable(activeSkill.skillData)
+		else
+			activeSkill.skillData = copyTable(activeSkill.basePerformSkillData)
+		end
+		local canReuseInactiveSkill = env.allowInactiveSkillReuse and activeSkill ~= env.player.mainSkill
+		local reuseSkillModList = not canReuseInactiveSkill
+			and not (env.disableActiveSkillReuse or env.disableSkillModListReuse)
+			and isCalculatorLikeMode(env.mode)
+			and (skipEHP or reuseReportDefenceOnly)
+			and activeSkill.skillModList
+			and not env.forceRebuildSkillModLists
+		if not reuseSkillModList then
+			activeSkill.skillModList = new("ModList", activeSkill.baseSkillModList)
+		end
+		if activeSkill.minion then
+			local reuseMinion = not (env.disableActiveSkillReuse or env.disableMinionReuse) and activeSkill.minion.modDB and activeSkill.minion.mainSkill and ((isCalculatorLikeMode(env.mode) and skipEHP) or reuseReportDefenceOnly)
+			if reuseMinion then
+				wipeTable(activeSkill.minion.modDB.mods)
+				wipeTable(activeSkill.minion.modDB.conditions)
+				wipeTable(activeSkill.minion.modDB.multipliers)
+				for _, minionSkill in ipairs(activeSkill.minion.activeSkillList or {}) do
+					if env.forceRebuildSkillModLists then
+						minionSkill.skillModList = new("ModList", minionSkill.baseSkillModList)
+					end
+					local skillData = minionSkill.skillData
+					minionSkill.skillData = { }
+					for _, value in ipairs(activeSkill.minion.modDB:List(minionSkill.skillCfg, "SkillData")) do
+						minionSkill.skillData[value.key] = value.value
+					end
+					for _, value in ipairs(minionSkill.skillModList:List(minionSkill.skillCfg, "SkillData")) do
+						minionSkill.skillData[value.key] = value.value
+					end
+					minionSkill.skillData.manaReservationPercent = skillData.manaReservationPercent
+					minionSkill.skillData.cooldown = skillData.cooldown
+					minionSkill.skillData.storedUses = skillData.storedUses
+					minionSkill.skillData.CritChance = skillData.CritChance
+					minionSkill.skillData.attackTime = skillData.attackTime
+					minionSkill.skillData.attackSpeedMultiplier = skillData.attackSpeedMultiplier
+					minionSkill.skillData.soulPreventionDuration = minionSkill.soulPreventionDuration
+					minionSkill.skillData.totemLevel = skillData.totemLevel
+					minionSkill.skillData.damageEffectiveness = skillData.damageEffectiveness
+					resetActiveSkillTransientState(minionSkill)
+				end
+			else
+				activeSkill.minion.modDB = new("ModDB")
+				activeSkill.minion.modDB.actor = activeSkill.minion
+				calcs.createMinionSkills(env, activeSkill)
+				for _, minionSkill in ipairs(activeSkill.minion.activeSkillList or {}) do
+					resetActiveSkillTransientState(minionSkill)
+				end
+			end
+			activeSkill.skillPartName = activeSkill.minion.mainSkill.activeEffect.grantedEffect.name
+		end
+	end
+end
+
+local function applyEnemyExposures(env, modDB, enemyDB)
+	local major, minor = env.spec.treeVersion:match("(%d+)_(%d+)")
+	for _, element in ipairs({"Fire", "Cold", "Lightning"}) do
+		if tonumber(major) <= 3 and tonumber(minor) <= 15 -- Elemental Equilibrium pre-3.16 does not remove Exposure effects
+			or not modDB:Flag(nil, "ElementalEquilibrium") -- if Elemental Equilibrium isn't active we just process Exposure normally
+			or element == "Fire" and not enemyDB:Flag(nil, "Condition:HitByFireDamage")
+			or element == "Cold" and not enemyDB:Flag(nil, "Condition:HitByColdDamage")
+			or element == "Lightning" and not enemyDB:Flag(nil, "Condition:HitByLightningDamage") then
+			local min = math.huge
+			local source = ""
+			for _, mod in ipairs(enemyDB:Tabulate("BASE", nil, element.."Exposure")) do
+				if mod.value < min then
+					min = mod.value
+					source = mod.mod.source
+				end
+			end
+			if min ~= math.huge then
+				-- Modify the magnitude of all exposures
+				for _, mod in ipairs(modDB:Tabulate("BASE", nil, "ExtraExposure", "Extra"..element.."Exposure")) do
+					min = min + mod.value
+				end
+				enemyDB:NewMod("Condition:Has"..element.."Exposure", "FLAG", true, "")
+				enemyDB:NewMod(element.."Resist", "BASE", m_min(min, modDB:Override(nil, "ExposureMin")), source)
+				modDB:NewMod("Condition:AppliedExposureRecently", "FLAG", true, "")
+			end
+		end
+	end
+end
+
+local function applyEnemyConsecratedGroundEffects(modDB, enemyDB)
+	if enemyDB:Flag(nil, "Condition:OnConsecratedGround") then
+		local effect = 1 + modDB:Sum("INC", nil, "ConsecratedGroundEffect") / 100
+		enemyDB:NewMod("DamageTaken", "INC", m_floor(enemyDB:Sum("INC", nil, "DamageTakenConsecratedGround") * effect), "Consecrated Ground")
+	end
+end
+
+local function calculateActorOffenceAndDefence(env, actor, skipEHP, allowMirages)
+	local reportContext = getReportContext(env)
+	local needsOffence = not reportContext or reportContext.needsOffence
+	local needsDefence = not reportContext or reportContext.needsDefence or needsOffence
+	if reportContext and reportContext.combinedOffDef and env.minion then
+		if actor == env.player then
+			needsOffence = false
+		end
+	end
+	if reportContext and actor == env.player and env.minion and not reportContext.combinedOffDef and reportContext.stat ~= "FullDPS" then
+		needsOffence = false
+		needsDefence = false
+	end
+	if reportContext and reportContext.stat == "FullDPS" and actor == env.player and env.player.mainSkill and env.player.mainSkill.minion then
+		needsOffence = false
+		needsDefence = reportContext.needsDefence
+	end
+	if needsDefence then
+		if env.fullDPSReportOnly then
+			calcs.defenceForOffence(env, actor)
+		else
+			calcs.defence(env, actor)
+		end
+	end
+	if needsDefence and not skipEHP and (not reportContext or reportContext.needsEHP) then
+		calcs.buildDefenceEstimations(env, actor)
+	end
+
+	if needsOffence then
+		calcs.triggers(env, actor)
+		if not allowMirages or not calcs.mirages(env) then
+			calcs.offence(env, actor, actor.mainSkill)
+		end
+	end
+end
+
+local function calculateMinionOffenceAndDefence(env, skipEHP)
+	if env.minion then
+		calculateActorOffenceAndDefence(env, env.minion, skipEHP, false)
+	end
+end
+
+function calcs.preparePerformShared(env, skipEHP)
+	-- Merge keystone modifiers
+	env.keystonesAdded = { }
+	modLib.mergeKeystones(env, env.modDB)
+
+	prepareActiveSkillsForPerform(env, skipEHP)
 end
 
 function doActorLifeMana(actor)
@@ -922,17 +1097,21 @@ local function doActorCharges(env, actor)
 	-- Calculate current and maximum charges
 	output.PowerChargesMin = m_max(modDB:Sum("BASE", nil, "PowerChargesMin"), 0)
 	output.PowerChargesMax = modDB:Override(nil, "PowerChargesMax") or m_max(modDB:Sum("BASE", nil, "PowerChargesMax"), 0)
-    output.PowerChargesDuration = m_floor(modDB:Sum("BASE", nil, "ChargeDuration") * calcLib.mod(modDB, nil, "PowerChargesDuration", "ChargeDuration"))
+	output.PowerChargesDuration = m_floor(modDB:Sum("BASE", nil, "ChargeDuration") * calcLib.mod(modDB, nil, "PowerChargesDuration", "ChargeDuration"))
 	if modDB:Flag(nil, "MaximumFrenzyChargesIsMaximumPowerCharges") then
-		local source = modDB.mods["MaximumFrenzyChargesIsMaximumPowerCharges"][1].source
-		modDB:ReplaceMod("FrenzyChargesMax", "OVERRIDE", output.PowerChargesMax, source)
+		for _, value in ipairs(modDB:Tabulate("FLAG", nil, "MaximumFrenzyChargesIsMaximumPowerCharges")) do
+			modDB:ReplaceMod("FrenzyChargesMax", "OVERRIDE", output.PowerChargesMax, value.mod.source)
+			break
+		end
 	end
 	output.FrenzyChargesMin = m_max(modDB:Sum("BASE", nil, "FrenzyChargesMin"), 0)
 	output.FrenzyChargesMax = modDB:Override(nil, "FrenzyChargesMax") or m_max(modDB:Flag(nil, "MaximumFrenzyChargesIsMaximumPowerCharges") and output.PowerChargesMax or modDB:Sum("BASE", nil, "FrenzyChargesMax"), 0)
 	output.FrenzyChargesDuration = m_floor(modDB:Sum("BASE", nil, "ChargeDuration") * calcLib.mod(modDB, nil, "FrenzyChargesDuration", "ChargeDuration"))
 	if modDB:Flag(nil, "MaximumEnduranceChargesIsMaximumFrenzyCharges") then
-		local source = modDB.mods["MaximumEnduranceChargesIsMaximumFrenzyCharges"][1].source
-		modDB:ReplaceMod("EnduranceChargesMax", "OVERRIDE", output.FrenzyChargesMax, source)
+		for _, value in ipairs(modDB:Tabulate("FLAG", nil, "MaximumEnduranceChargesIsMaximumFrenzyCharges")) do
+			modDB:ReplaceMod("EnduranceChargesMax", "OVERRIDE", output.FrenzyChargesMax, value.mod.source)
+			break
+		end
 	end
 	output.EnduranceChargesMin = m_max(modDB:Sum("BASE", nil, "EnduranceChargesMin"), 0)
 	output.EnduranceChargesMax = modDB:Override(nil, "EnduranceChargesMax") or m_max(env.partyMembers.modDB:Flag(nil, "PartyMemberMaximumEnduranceChargesEqualToYours") and env.partyMembers.output.EnduranceChargesMax or (modDB:Flag(nil, "MaximumEnduranceChargesIsMaximumFrenzyCharges") and output.FrenzyChargesMax or modDB:Sum("BASE", nil, "EnduranceChargesMax")), 0)
@@ -1088,24 +1267,9 @@ end
 -- 8. Processes buffs and debuffs
 -- 9. Processes charges and misc buffs (doActorCharges, doActorMisc)
 -- 10. Calculates defence and offence stats (calcs.defence, calcs.offence)
-function calcs.perform(env, skipEHP)
+function calcs.performPrepared(env, skipEHP)
 	local modDB = env.modDB
 	local enemyDB = env.enemyDB
-
-	-- Merge keystone modifiers
-	env.keystonesAdded = { }
-	modLib.mergeKeystones(env, env.modDB)
-
-	-- Build minion skills
-	for _, activeSkill in ipairs(env.player.activeSkillList) do
-		activeSkill.skillModList = new("ModList", activeSkill.baseSkillModList)
-		if activeSkill.minion then
-			activeSkill.minion.modDB = new("ModDB")
-			activeSkill.minion.modDB.actor = activeSkill.minion
-			calcs.createMinionSkills(env, activeSkill)
-			activeSkill.skillPartName = activeSkill.minion.mainSkill.activeEffect.grantedEffect.name
-		end
-	end
 
 	env.player.output = { }
 	env.enemy.output = { }
@@ -1113,7 +1277,7 @@ function calcs.perform(env, skipEHP)
 
 	env.partyMembers = env.build.partyTab.actor
 	env.player.partyMembers = env.partyMembers
-	local partyTabEnableExportBuffs = env.build.partyTab.enableExportBuffs and env.mode ~= "CALCULATOR"
+	local partyTabEnableExportBuffs = env.build.partyTab.enableExportBuffs and not isCalculatorLikeMode(env.mode)
 
 	env.minion = env.player.mainSkill.minion
 	if env.minion then
@@ -1237,14 +1401,18 @@ function calcs.perform(env, skipEHP)
 	output.WarcryPower = modDB:Override(nil, "WarcryPower") or modDB:Sum("BASE", nil, "WarcryPower") or 0
 	modDB.multipliers["WarcryPower"] = output.WarcryPower
 
-	applyEnemyModifiers(env.player, true)
-	if env.minion then
-		applyEnemyModifiers(env.minion, true)
+	local reportContext = getReportContext(env)
+	local needsEnemyContext = not reportContext or reportContext.needsEnemy
+	if needsEnemyContext then
+		applyEnemyModifiers(env.player, true)
+		if env.minion then
+			applyEnemyModifiers(env.minion, true)
+		end
+		applyEnemyModifiers(env.enemy, true)
 	end
-	applyEnemyModifiers(env.enemy, true)
 
 	for _, activeSkill in ipairs(env.player.activeSkillList) do
-		if activeSkill.skillTypes[SkillType.Brand] then
+		if needsEnemyContext and activeSkill.skillTypes[SkillType.Brand] then
 			local attachLimit = activeSkill.skillModList:Sum("BASE", activeSkill.skillCfg, "BrandsAttachedLimit")
 			local attached = modDB:Sum("BASE", nil, "Multiplier:ConfigBrandsAttachedToEnemy")
 			local activeBrands = modDB:Sum("BASE", nil, "Multiplier:ConfigActiveBrands")
@@ -1254,7 +1422,7 @@ function calcs.perform(env, skipEHP)
 			modDB.multipliers["BrandsAttachedToEnemy"] = m_max(actual, modDB.multipliers["BrandsAttachedToEnemy"] or 0)
 			enemyDB.multipliers["BrandsAttached"] = m_max(actual, enemyDB.multipliers["BrandsAttached"] or 0)
 		end
-		if activeSkill.skillFlags.totem then
+		if needsEnemyContext and activeSkill.skillFlags.totem then
 			local limit = env.player.mainSkill.skillModList:Sum("BASE", env.player.mainSkill.skillCfg, "ActiveTotemLimit", "ActiveBallistaLimit" )
 			output.ActiveTotemLimit = m_max(limit, output.ActiveTotemLimit or 0)
 			output.TotemsSummoned = modDB:Override(nil, "TotemsSummoned") or output.ActiveTotemLimit
@@ -1262,7 +1430,7 @@ function calcs.perform(env, skipEHP)
 		end
 		-- The actual hexes as opposed to hex related skills all have the curse flag. TotemCastsWhenNotDetached is to remove blasphemy
 		-- Note that this doesn't work for triggers yet, insufficient support
-		if activeSkill.skillFlags.hex and activeSkill.skillFlags.curse and not activeSkill.skillTypes[SkillType.TotemCastsWhenNotDetached] and activeSkill.skillModList:Sum("BASE", nil, "MaxDoom") then
+		if needsEnemyContext and activeSkill.skillFlags.hex and activeSkill.skillFlags.curse and not activeSkill.skillTypes[SkillType.TotemCastsWhenNotDetached] and activeSkill.skillModList:Sum("BASE", nil, "MaxDoom") then
 			local hexDoom = modDB:Sum("BASE", nil, "Multiplier:HexDoomStack")
 			local maxDoom = activeSkill.skillModList:Sum("BASE", nil, "MaxDoom")
 			local doomEffect = activeSkill.skillModList:More(nil, "DoomEffect")
@@ -1272,15 +1440,15 @@ function calcs.perform(env, skipEHP)
 			activeSkill.skillModList:NewMod("CurseEffect", "INC", m_min(hexDoom, maxDoom) * doomEffect, "Doom")
 			modDB.multipliers["HexDoom"] =  m_min(m_max(hexDoom, modDB.multipliers["HexDoom"] or 0), output.HexDoomLimit)
 		end
-		if (activeSkill.activeEffect.grantedEffect.name == "Vaal Lightning Trap" or activeSkill.activeEffect.grantedEffect.name == "Shock Ground") then
+		if needsEnemyContext and (activeSkill.activeEffect.grantedEffect.name == "Vaal Lightning Trap" or activeSkill.activeEffect.grantedEffect.name == "Shock Ground") then
 			-- Shock effect applies to shocked ground
 			local effect = activeSkill.skillModList:Sum("BASE", nil, "ShockedGroundEffect") * (1 + activeSkill.skillModList:Sum("INC", nil, "EnemyShockEffect") / 100)
 			modDB:NewMod("ShockOverride", "BASE", effect, "Shocked Ground", { type = "ActorCondition", actor = "enemy", var = "OnShockedGround" } )
 		end
-		if activeSkill.skillData.supportBonechill and (activeSkill.skillTypes[SkillType.ChillingArea] or activeSkill.skillTypes[SkillType.NonHitChill] or not activeSkill.skillModList:Flag(nil, "CannotChill")) then
+		if needsEnemyContext and activeSkill.skillData.supportBonechill and (activeSkill.skillTypes[SkillType.ChillingArea] or activeSkill.skillTypes[SkillType.NonHitChill] or not activeSkill.skillModList:Flag(nil, "CannotChill")) then
 			output.HasBonechill = true
 		end
-		if activeSkill.activeEffect.grantedEffect.name == "Summon Skitterbots" then
+		if needsEnemyContext and activeSkill.activeEffect.grantedEffect.name == "Summon Skitterbots" then
 			local skitterbotAilmentEffect = activeSkill.skillModList:Sum("INC", nil, "SkitterbotAilmentEffect")
 			if not activeSkill.skillModList:Flag(nil, "SkitterbotsCannotShock") then
 				local effect = data.nonDamagingAilment.Shock.default * (1 + (activeSkill.skillModList:Sum("INC", { source = "Skill" }, "EnemyShockEffect") + skitterbotAilmentEffect) / 100)
@@ -1313,7 +1481,7 @@ function calcs.perform(env, skipEHP)
 					modDB:NewMod("SelfScorchOverride", "BASE", effect, activeSkill.activeEffect.grantedEffect.name)
 				end
 			end
-		elseif activeSkill.skillTypes[SkillType.ChillingArea] or (activeSkill.skillTypes[SkillType.NonHitChill] and not activeSkill.skillModList:Flag(nil, "CannotChill")) then
+		elseif needsEnemyContext and (activeSkill.skillTypes[SkillType.ChillingArea] or (activeSkill.skillTypes[SkillType.NonHitChill] and not activeSkill.skillModList:Flag(nil, "CannotChill"))) then
 			local effect = data.nonDamagingAilment.Chill.default * calcLib.mod(activeSkill.skillModList, activeSkill.skillCfg, "EnemyChillEffect")
 			modDB:NewMod("ChillOverride", "BASE", effect, activeSkill.activeEffect.grantedEffect.name)
 			enemyDB:NewMod("Condition:Chilled", "FLAG", true, activeSkill.activeEffect.grantedEffect.name)
@@ -1354,7 +1522,6 @@ function calcs.perform(env, skipEHP)
 			activeSkill.infoTrigger = "Saviour"
 		end
 	end
-
 	-- Special Rarity / Quantity Calc for Bisco's
 	local lootQuantityNormalEnemies = modDB:Sum("INC", nil, "LootQuantityNormalEnemies")
 	output.LootQuantityNormalEnemies = (lootQuantityNormalEnemies > 0) and lootQuantityNormalEnemies + modDB:Sum("INC", nil, "LootQuantity") or 0
@@ -2002,7 +2169,6 @@ function calcs.perform(env, skipEHP)
 			end
 		end
 	end
-
 	if modDB:Flag(nil, "ManaAppliesToShockEffect") then
 		-- Maximum Mana conversion from Lightning Mastery
 		local multiplier = (modDB:Max(nil, "ImprovedManaAppliesToShockEffect") or 100) / 100
@@ -2922,7 +3088,6 @@ function calcs.perform(env, skipEHP)
 			end
 		end
 	end
-
 	if env.mode_combat then
 		-- This needs to be done in 2 steps to account for effects affecting life recovery from flasks
 		-- For example Sorrow of the Divine and buffs (like flask recovery watchers eye)
@@ -3281,9 +3446,10 @@ function calcs.perform(env, skipEHP)
 		doActorMisc(env, env.minion)
 	end
 
-	-- Calculate maximum and apply the strongest non-damaging ailments
-	local ailmentData = data.nonDamagingAilment
-	local ailments = {
+	if needsEnemyContext then
+		-- Calculate maximum and apply the strongest non-damaging ailments
+		local ailmentData = data.nonDamagingAilment
+		local ailments = {
 		["Chill"] = {
 			condition = "Chilled",
 			mods = function(num)
@@ -3343,120 +3509,74 @@ function calcs.perform(env, skipEHP)
 				return { modLib.createMod("Damage", "MORE", -num, "Sap", { type = "Condition", var = "Sapped" }) }
 			end
 		},
-	}
+		}
 
-	for ailment, val in pairs(ailments) do
-		if (enemyDB:Sum("BASE", nil, ailment.."Val") > 0
-		or modDB:Sum("BASE", nil, ailment.."Base", ailment.."Override", ailment.."Minimum"))
-		and not (enemyDB:Flag(nil, "Condition:Already"..val.condition) or enemyDB:Flag(nil, ailment.."Immune", "ElementalAilmentImmune") or enemyDB:Sum("BASE", nil, "Avoid"..ailment, "AvoidAilments", "AvoidElementalAilments") >= 100) then
-			local override = 0
-			local minimum = 0
-			for _, value in ipairs(modDB:Tabulate("BASE", nil, ailment.."Base", ailment.."Override", ailment.."Minimum")) do
-				local mod = value.mod
-				local effect = mod.value
-				if mod.name == ailment.."Override" then
-					enemyDB:NewMod("Condition:"..val.condition, "FLAG", true, mod.source)
-				end
-				if mod.name == ailment.."Base" or mod.name == ailment.."Minimum" then
-					-- If the main skill can inflict the ailment, the ailment is inflicted with a hit, and we have a node allocated that checks what our highest damage is, then
-					-- use the skill's ailment modifiers
-					-- if not, use the generic modifiers
-					-- Scorch/Sap/Brittle do not have guaranteed sources from hits, and therefore will only end up in this bit of code if it's not supposed to apply the skillModList, which is bad
-					if ailment ~= "Scorch" and ailment ~= "Sap" and ailment ~= "Brittle" and not env.player.mainSkill.skillModList:Flag(nil, "Cannot"..ailment) and env.player.mainSkill.skillFlags.hit and modDB:Flag(nil, "ChecksHighestDamage") then
-						effect = effect * calcLib.mod(env.player.mainSkill.skillModList, nil, "Enemy"..ailment.."Effect")
-					else
-						effect = effect * calcLib.mod(modDB, nil, "Enemy"..ailment.."Effect")
+		for ailment, val in pairs(ailments) do
+			if (enemyDB:Sum("BASE", nil, ailment.."Val") > 0
+			or modDB:Sum("BASE", nil, ailment.."Base", ailment.."Override", ailment.."Minimum"))
+			and not (enemyDB:Flag(nil, "Condition:Already"..val.condition) or enemyDB:Flag(nil, ailment.."Immune", "ElementalAilmentImmune") or enemyDB:Sum("BASE", nil, "Avoid"..ailment, "AvoidAilments", "AvoidElementalAilments") >= 100) then
+				local override = 0
+				local minimum = 0
+				for _, value in ipairs(modDB:Tabulate("BASE", nil, ailment.."Base", ailment.."Override", ailment.."Minimum")) do
+					local mod = value.mod
+					local effect = mod.value
+					if mod.name == ailment.."Override" then
+						enemyDB:NewMod("Condition:"..val.condition, "FLAG", true, mod.source)
 					end
-					modDB:NewMod(ailment.."Override", "BASE", effect, mod.source, mod.flags, mod.keywordFlags, unpack(mod))
-					if mod.name == ailment.."Minimum" then
-						minimum = minimum + effect
+					if mod.name == ailment.."Base" or mod.name == ailment.."Minimum" then
+						-- If the main skill can inflict the ailment, the ailment is inflicted with a hit, and we have a node allocated that checks what our highest damage is, then
+						-- use the skill's ailment modifiers
+						-- if not, use the generic modifiers
+						-- Scorch/Sap/Brittle do not have guaranteed sources from hits, and therefore will only end up in this bit of code if it's not supposed to apply the skillModList, which is bad
+						if ailment ~= "Scorch" and ailment ~= "Sap" and ailment ~= "Brittle" and not env.player.mainSkill.skillModList:Flag(nil, "Cannot"..ailment) and env.player.mainSkill.skillFlags.hit and modDB:Flag(nil, "ChecksHighestDamage") then
+							effect = effect * calcLib.mod(env.player.mainSkill.skillModList, nil, "Enemy"..ailment.."Effect")
+						else
+							effect = effect * calcLib.mod(modDB, nil, "Enemy"..ailment.."Effect")
+						end
+						modDB:NewMod(ailment.."Override", "BASE", effect, mod.source, mod.flags, mod.keywordFlags, unpack(mod))
+						if mod.name == ailment.."Minimum" then
+							minimum = minimum + effect
+						end
+					end
+					override = m_max(m_max(override, effect or 0), minimum)
+				end
+				local maxAilment = modDB:Override(nil, ailment.."Max") or 0
+				if not modDB:Override(nil, ailment.."Max") then
+					for _, skill in ipairs(env.player.activeSkillList) do
+						local skillMax = modDB:Override(nil, ailment.."Max") or (ailmentData[ailment].max + skill.baseSkillModList:Sum("BASE", nil, ailment.."Max"))
+						maxAilment = skillMax > maxAilment and skillMax or maxAilment
 					end
 				end
-				override = m_max(m_max(override, effect or 0), minimum)
-			end
-			local maxAilment = modDB:Override(nil, ailment.."Max") or 0
-			if not modDB:Override(nil, ailment.."Max") then
-				for _, skill in ipairs(env.player.activeSkillList) do
-					local skillMax = modDB:Override(nil, ailment.."Max") or (ailmentData[ailment].max + skill.baseSkillModList:Sum("BASE", nil, ailment.."Max"))
-					maxAilment = skillMax > maxAilment and skillMax or maxAilment
+				output["Maximum"..ailment] = maxAilment
+				output["Current"..ailment] = m_floor(m_min(m_max(override, enemyDB:Sum("BASE", nil, ailment.."Val")), output["Maximum"..ailment]) * (10 ^ ailmentData[ailment].precision)) / (10 ^ ailmentData[ailment].precision)
+				for _, mod in ipairs(val.mods(output["Current"..ailment])) do
+					enemyDB:AddMod(mod)
 				end
-			end
-			output["Maximum"..ailment] = maxAilment
-			output["Current"..ailment] = m_floor(m_min(m_max(override, enemyDB:Sum("BASE", nil, ailment.."Val")), output["Maximum"..ailment]) * (10 ^ ailmentData[ailment].precision)) / (10 ^ ailmentData[ailment].precision)
-			for _, mod in ipairs(val.mods(output["Current"..ailment])) do
-				enemyDB:AddMod(mod)
-			end
-			enemyDB:NewMod("Condition:Already"..val.condition, "FLAG", true, { type = "Condition", var = val.condition } ) -- Prevents ailment from applying doubly for minions
-		end
-	end
-
-	-- Update chill and shock multipliers
-	local chillEffectMultiplier = enemyDB:Sum("BASE", nil, "Multiplier:ChillEffect")
-	if output["CurrentChill"] and chillEffectMultiplier < output["CurrentChill"] then
-		enemyDB:NewMod("Multiplier:ChillEffect", "BASE", output["CurrentChill"] - chillEffectMultiplier, "")
-	end
-	local shockEffectMultiplier = enemyDB:Sum("BASE", nil, "Multiplier:ShockEffect")
-	if output["CurrentShock"] and shockEffectMultiplier < output["CurrentShock"] then
-		enemyDB:NewMod("Multiplier:ShockEffect", "BASE", output["CurrentShock"] - shockEffectMultiplier, "")
-	end
-
-	doActorCharges(env, env.enemy)
-	doActorMisc(env, env.enemy)
-
-	local major, minor = env.spec.treeVersion:match("(%d+)_(%d+)")
-
-	-- Apply exposures
-	for _, element in ipairs({"Fire", "Cold", "Lightning"}) do
-		if tonumber(major) <= 3 and tonumber(minor) <= 15 -- Elemental Equilibrium pre-3.16 does not remove Exposure effects
-			or not modDB:Flag(nil, "ElementalEquilibrium") -- if Elemental Equilibrium isn't active we just process Exposure normally
-			or element == "Fire" and not enemyDB:Flag(nil, "Condition:HitByFireDamage")
-			or element == "Cold" and not enemyDB:Flag(nil, "Condition:HitByColdDamage")
-			or element == "Lightning" and not enemyDB:Flag(nil, "Condition:HitByLightningDamage") then
-			local min = math.huge
-			local source = ""
-			for _, mod in ipairs(enemyDB:Tabulate("BASE", nil, element.."Exposure")) do
-				if mod.value < min then
-					min = mod.value
-					source = mod.mod.source
-				end
-			end
-			if min ~= math.huge then
-				-- Modify the magnitude of all exposures
-				for _, mod in ipairs(modDB:Tabulate("BASE", nil, "ExtraExposure", "Extra"..element.."Exposure")) do
-					min = min + mod.value
-				end
-				enemyDB:NewMod("Condition:Has"..element.."Exposure", "FLAG", true, "")
-				enemyDB:NewMod(element.."Resist", "BASE", m_min(min, modDB:Override(nil, "ExposureMin")), source)
-				modDB:NewMod("Condition:AppliedExposureRecently", "FLAG", true, "")
+				enemyDB:NewMod("Condition:Already"..val.condition, "FLAG", true, { type = "Condition", var = val.condition } ) -- Prevents ailment from applying doubly for minions
 			end
 		end
-	end
 
-	-- Handle consecrated ground effects on enemies
-	if enemyDB:Flag(nil, "Condition:OnConsecratedGround") then
-		local effect = 1 + modDB:Sum("INC", nil, "ConsecratedGroundEffect") / 100
-		enemyDB:NewMod("DamageTaken", "INC", m_floor(enemyDB:Sum("INC", nil, "DamageTakenConsecratedGround") * effect), "Consecrated Ground")
-	end
+		-- Update chill and shock multipliers
+		local chillEffectMultiplier = enemyDB:Sum("BASE", nil, "Multiplier:ChillEffect")
+		if output["CurrentChill"] and chillEffectMultiplier < output["CurrentChill"] then
+			enemyDB:NewMod("Multiplier:ChillEffect", "BASE", output["CurrentChill"] - chillEffectMultiplier, "")
+		end
+		local shockEffectMultiplier = enemyDB:Sum("BASE", nil, "Multiplier:ShockEffect")
+		if output["CurrentShock"] and shockEffectMultiplier < output["CurrentShock"] then
+			enemyDB:NewMod("Multiplier:ShockEffect", "BASE", output["CurrentShock"] - shockEffectMultiplier, "")
+		end
 
+		doActorCharges(env, env.enemy)
+		doActorMisc(env, env.enemy)
+
+		applyEnemyExposures(env, modDB, enemyDB)
+
+		-- Handle consecrated ground effects on enemies
+		applyEnemyConsecratedGroundEffects(modDB, enemyDB)
+	end
 	-- Defence/offence calculations
-	calcs.defence(env, env.player)
-	if not skipEHP then
-		calcs.buildDefenceEstimations(env, env.player)
-	end
-
-	calcs.triggers(env, env.player)
-	if not calcs.mirages(env) then
-		calcs.offence(env, env.player, env.player.mainSkill)
-	end
-
-	if env.minion then
-		calcs.defence(env, env.minion)
-		if not skipEHP then -- main.build.calcsTab.input.showMinion and -- should be disabled unless "calcsTab.input.showMinion" is true
-			calcs.buildDefenceEstimations(env, env.minion)
-		end
-		calcs.triggers(env, env.minion)
-		calcs.offence(env, env.minion, env.minion.mainSkill)
-	end
+	calculateActorOffenceAndDefence(env, env.player, skipEHP, true)
+	calculateMinionOffenceAndDefence(env, skipEHP)
 
 	 -- Export modifiers to enemy conditions and stats for party tab
 	if partyTabEnableExportBuffs then
@@ -3633,4 +3753,9 @@ function calcs.perform(env, skipEHP)
 	end
 
 	cacheData(cacheSkillUUID(env.player.mainSkill, env), env)
+end
+
+function calcs.perform(env, skipEHP)
+	calcs.preparePerformShared(env, skipEHP)
+	return calcs.performPrepared(env, skipEHP)
 end

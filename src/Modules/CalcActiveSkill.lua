@@ -848,7 +848,6 @@ function calcs.createMinionSkills(env, activeSkill)
 	local minion = activeSkill.minion
 	local minionData = minion.minionData
 
-	minion.activeSkillList = { }
 	local skillIdList = { }
 	for _, skillId in ipairs(minionData.skillList) do
 		if env.data.skills[skillId] then
@@ -864,6 +863,7 @@ function calcs.createMinionSkills(env, activeSkill)
 		-- Not ideal, but let's avoid horrible crashes if a spectre has no skills for some reason
 		t_insert(skillIdList, "Melee")
 	end
+	minion.activeSkillList = { }
 	for _, skillId in ipairs(skillIdList) do
 		local activeEffect = {
 			grantedEffect = env.data.skills[skillId],

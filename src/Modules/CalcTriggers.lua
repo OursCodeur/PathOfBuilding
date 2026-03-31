@@ -19,6 +19,10 @@ local m_huge = math.huge
 local bor = bit.bor
 local band = bit.band
 
+local function isCalculatorLikeMode(mode)
+	return mode == "CALCULATOR" or mode == "REPORT"
+end
+
 -- Add trigger-based damage modifiers
 local function addTriggerIncMoreMods(activeSkill, sourceSkill)
 	for _, value in ipairs(activeSkill.skillModList:Tabulate("INC", sourceSkill.skillCfg, "TriggeredDamage")) do
@@ -75,7 +79,7 @@ local function findTriggerSkill(env, skill, source, triggerRate, comparer)
 	local comparer = comparer or defaultComparer
 
 	local uuid = cacheSkillUUID(skill, env)
-	if not GlobalCache.cachedData[env.mode][uuid] or env.mode == "CALCULATOR" then
+	if not GlobalCache.cachedData[env.mode][uuid] or isCalculatorLikeMode(env.mode) then
 		calcs.buildActiveSkill(env, env.mode, skill, uuid)
 	end
 
@@ -1278,7 +1282,7 @@ local configTable = {
 	["shattershard"] = function(env)
         env.player.mainSkill.skillFlags.globalTrigger = true
 		local uuid = cacheSkillUUID(env.player.mainSkill, env)
-		if not GlobalCache.cachedData[env.mode][uuid] or env.mode == "CALCULATOR" then
+		if not GlobalCache.cachedData[env.mode][uuid] or isCalculatorLikeMode(env.mode) then
 			calcs.buildActiveSkill(env, env.mode, env.player.mainSkill, uuid, {uuid})
 		end
 		env.player.mainSkill.skillData.triggerRateCapOverride = 1 / GlobalCache.cachedData[env.mode][uuid].Env.player.output.Duration
@@ -1431,7 +1435,7 @@ local configTable = {
 					if skill.activeEffect.grantedEffect.name == "Snipe" and skill.socketGroup and skill.socketGroup.slot == env.player.mainSkill.socketGroup.slot then
 						skill.skillData.hitTimeMultiplier = snipeStages - 0.5
 						local uuid = cacheSkillUUID(skill, env)
-						if not GlobalCache.cachedData[env.mode][uuid] or env.mode == "CALCULATOR" then
+						if not GlobalCache.cachedData[env.mode][uuid] or isCalculatorLikeMode(env.mode) then
 							calcs.buildActiveSkill(env, env.mode, skill, uuid)
 						end
 						local cachedSpeed = GlobalCache.cachedData[env.mode][uuid].Env.player.output.HitSpeed

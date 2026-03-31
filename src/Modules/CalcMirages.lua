@@ -19,6 +19,10 @@ local m_huge = math.huge
 local bor = bit.bor
 local band = bit.band
 
+local function isCalculatorLikeMode(mode)
+	return mode == "CALCULATOR" or mode == "REPORT"
+end
+
 local function calculateMirage(env, config)
 	if not config then
 		return
@@ -193,7 +197,7 @@ function calcs.mirages(env)
 				local skillTypeExcludes = skill.skillTypes[SkillType.Vaal] or skill.skillTypes[SkillType.Totem] or skill.skillTypes[SkillType.SummonsTotem]
 				if skill ~= env.player.mainSkill and not isTriggered(skill) and not isDisabled and skillTypeMatch and not skillTypeExcludes and not skill.skillCfg.skillCond["usedByMirage"] then
 					local uuid = cacheSkillUUID(skill, env)
-					if not GlobalCache.cachedData[env.mode][uuid] or env.mode == "CALCULATOR" then
+					if not GlobalCache.cachedData[env.mode][uuid] or isCalculatorLikeMode(env.mode) then
 						calcs.buildActiveSkill(env, env.mode, skill, uuid)
 					end
 
@@ -367,7 +371,7 @@ function calcs.mirages(env)
 		env.player.mainSkill.skillCfg.skillCond["usedByMirage"] = true
 		env.player.mainSkill.skillTypes[SkillType.OtherThingUsesSkill] = true
 
-		if not GlobalCache.cachedData[env.mode][uuid] or env.mode == "CALCULATOR" then
+		if not GlobalCache.cachedData[env.mode][uuid] or isCalculatorLikeMode(env.mode) then
 			calcs.buildActiveSkill(env, env.mode, env.player.mainSkill, uuid, {uuid})
 		end
 		local mainSkillOutputCache = GlobalCache.cachedData[env.mode][uuid].Env.player.output

@@ -439,6 +439,10 @@ function calcs.initEnv(build, mode, override, specEnv)
 		wipeEnv(env, accelerate)
 		modDB = env.modDB
 		enemyDB = env.enemyDB
+		env.mode = mode
+		env.spec = override.spec or build.spec
+		env.override = override
+		env.classId = env.spec.curClassId
 	end
 
 	-- Set buff mode

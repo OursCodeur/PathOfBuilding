@@ -807,6 +807,7 @@ function wipeGlobalCache()
 	wipeTable(GlobalCache.cachedData.MAIN)
 	wipeTable(GlobalCache.cachedData.CALCS)
 	wipeTable(GlobalCache.cachedData.CALCULATOR)
+	wipeTable(GlobalCache.cachedData.REPORT)
 end
 
 -- Check if a specific named gem is enabled in a socket group belonging to a skill

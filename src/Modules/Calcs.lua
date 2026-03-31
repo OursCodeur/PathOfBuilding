@@ -9,6 +9,7 @@ local t_insert = table.insert
 local s_format = string.format
 local m_min = math.min
 local m_ceil = math.ceil
+local REPORT_MODE = "REPORT"
 
 local calcs = { }
 calcs.breakdownModule = "Modules/CalcBreakdown"
@@ -19,6 +20,181 @@ LoadModule("Modules/CalcDefence", calcs)
 LoadModule("Modules/CalcOffence", calcs)
 LoadModule("Modules/CalcTriggers", calcs)
 LoadModule("Modules/CalcMirages.lua", calcs)
+
+local function reportStatNeedsEHP(reportStat)
+	local stat = type(reportStat) == "table" and reportStat.stat or reportStat
+	return stat == "TotalEHP"
+		or stat == "SecondMinimalMaximumHitTaken"
+		or stat == "PhysicalTakenHit"
+		or stat == "LightningTakenHit"
+		or stat == "ColdTakenHit"
+		or stat == "FireTakenHit"
+		or stat == "ChaosTakenHit"
+end
+
+local function buildCombinedOffDefReportOutput(output)
+	local reportOutput = {
+		CombinedDPS = output.CombinedDPS,
+		LifeUnreserved = output.LifeUnreserved,
+		Life = output.Life,
+		Armour = output.Armour,
+		EnergyShieldRecoveryCap = output.EnergyShieldRecoveryCap,
+		EnergyShield = output.EnergyShield,
+		Evasion = output.Evasion,
+		LifeRegenRecovery = output.LifeRegenRecovery,
+		EnergyShieldRegenRecovery = output.EnergyShieldRegenRecovery,
+	}
+	if output.Minion then
+		reportOutput.Minion = {
+			CombinedDPS = output.Minion.CombinedDPS,
+		}
+	end
+	return reportOutput
+end
+
+local function buildSingleStatReportOutput(output, reportStat)
+	local stat = reportStat and reportStat.stat
+	if not stat then
+		return output
+	end
+	local reportOutput = {
+		[stat] = output[stat],
+	}
+	if output.Minion then
+		reportOutput.Minion = {
+			[stat] = output.Minion[stat],
+		}
+	end
+	return reportOutput
+end
+
+local function buildReportOutput(output, reportStat)
+	if not reportStat then
+		return output
+	end
+	if reportStat.combinedOffDef then
+		return buildCombinedOffDefReportOutput(output)
+	end
+	return buildSingleStatReportOutput(output, reportStat)
+end
+
+local function isReusableReportNode(node)
+	return type(node) == "table"
+		and node.type ~= "Keystone"
+		and not node.isTattoo
+		and type(node.modKey) == "string"
+		and not node.modKey:find("|LIST|", 1, true)
+end
+
+local function canReuseReportOverride(override)
+	if not override
+		or override.spec
+		or override.conditions
+		or override.repItem
+		or override.repSlotName
+		or override.toggleFlask
+		or override.toggleTincture
+		or override.extraJewelFuncs then
+		return false
+	end
+	for _, nodeListName in ipairs({ "addNodes", "removeNodes" }) do
+		local nodeList = override[nodeListName]
+		if nodeList then
+			for node in pairs(nodeList) do
+				if not isReusableReportNode(node) then
+					return false
+				end
+			end
+		end
+	end
+	return override.addNodes or override.removeNodes
+end
+
+local fullOffenceCalculatorStats = {
+	CombinedDPS = true,
+	TotalDPS = true,
+	WithImpaleDPS = true,
+	AverageDamage = true,
+	Speed = true,
+	TotalDot = true,
+	BleedDPS = true,
+	IgniteDPS = true,
+	PoisonDPS = true,
+	LifeLeechRate = true,
+	ManaLeechRate = true,
+	CritChance = true,
+	CritMultiplier = true,
+	BleedChance = true,
+	FreezeChance = true,
+	IgniteChance = true,
+	PoisonChance = true,
+	ShockChance = true,
+}
+
+local reportCalculatorStats = {
+	Life = true,
+	LifeRegen = true,
+	Armour = true,
+	Evasion = true,
+	EnergyShield = true,
+	EnergyShieldRecoveryCap = true,
+	EnergyShieldRegen = true,
+	Mana = true,
+	ManaRegen = true,
+	Ward = true,
+	Str = true,
+	Dex = true,
+	Int = true,
+	TotalAttr = true,
+}
+
+local function buildReportContext(reportStat)
+	if not reportStat then
+		return nil
+	end
+	if reportStat.combinedOffDef then
+		return {
+			stat = reportStat.stat,
+			combinedOffDef = true,
+			needsDefence = true,
+			needsOffence = true,
+			needsEHP = false,
+			needsEnemy = true,
+		}
+	end
+	local stat = reportStat.stat
+	if reportStatNeedsEHP(stat) then
+	return {
+		stat = stat,
+		needsDefence = true,
+		needsOffence = false,
+		needsEHP = true,
+		needsEnemy = true,
+	}
+	end
+	if fullOffenceCalculatorStats[stat] then
+	return {
+		stat = stat,
+		needsDefence = false,
+		needsOffence = true,
+		needsEHP = false,
+		needsEnemy = true,
+	}
+	end
+	return {
+		stat = stat,
+		needsDefence = true,
+		needsOffence = false,
+		needsEHP = false,
+		needsEnemy = false,
+	}
+end
+
+local function requiresFullCalculatorPath(reportStat)
+	return reportStat
+		and reportStat.stat ~= "FullDPS"
+		and (reportStat.combinedOffDef or not reportCalculatorStats[reportStat.stat])
+end
 
 -- Get the average value of a table -- note this is unused
 function math.average(t)
@@ -70,17 +246,29 @@ local function infoDump(env)
 end
 
 -- Generate a function for calculating the effect of some modification to the environment
-local function getCalculator(build, fullInit, modFunc)
+local function getCalculator(build, fullInit, modFunc, reportStat)
+	local useFullCalculatorPath = requiresFullCalculatorPath(reportStat)
+	local useFullDPS = reportStat and reportStat.stat == "FullDPS"
+	local skipEHP = not reportStatNeedsEHP(reportStat)
 	-- Initialise environment
-	local env, cachedPlayerDB, cachedEnemyDB, cachedMinionDB = calcs.initEnv(build, "CALCULATOR")
+	local calcMode = useFullCalculatorPath and "CALCULATOR" or REPORT_MODE
+	local env, cachedPlayerDB, cachedEnemyDB, cachedMinionDB = calcs.initEnv(build, calcMode)
+	env.reportContext = useFullCalculatorPath and nil or buildReportContext(reportStat)
 
 	-- Run base calculation pass
-	calcs.perform(env)
-	local fullDPS = calcs.calcFullDPS(build, "CALCULATOR", {}, { cachedPlayerDB = cachedPlayerDB, cachedEnemyDB = cachedEnemyDB, cachedMinionDB = cachedMinionDB, env = nil })
-	env.player.output.SkillDPS = fullDPS.skills
-	env.player.output.FullDPS = fullDPS.combinedDPS
-	env.player.output.FullDotDPS = fullDPS.TotalDotDPS
-	local baseOutput = env.player.output
+	if useFullCalculatorPath then
+		calcs.perform(env)
+	else
+		calcs.perform(env, skipEHP)
+	end
+	local fullDPS
+	if useFullDPS then
+		fullDPS = calcs.calcFullDPS(build, "CALCULATOR", {}, { cachedPlayerDB = cachedPlayerDB, cachedEnemyDB = cachedEnemyDB, cachedMinionDB = cachedMinionDB, env = nil })
+		env.player.output.SkillDPS = fullDPS.skills
+		env.player.output.FullDPS = fullDPS.combinedDPS
+		env.player.output.FullDotDPS = fullDPS.TotalDotDPS
+	end
+	local baseOutput = useFullCalculatorPath and env.player.output or buildReportOutput(env.player.output, reportStat)
 
 	env.modDB.parent = cachedPlayerDB
 	env.enemyDB.parent = cachedEnemyDB
@@ -88,7 +276,7 @@ local function getCalculator(build, fullInit, modFunc)
 		env.minion.modDB.parent = cachedMinionDB
 	end
 
-	return function(...)
+	return function(override, useFullDPSOverride)
 		-- Remove mods added during the last pass
 		wipeTable(env.modDB.mods)
 		wipeTable(env.modDB.conditions)
@@ -96,55 +284,105 @@ local function getCalculator(build, fullInit, modFunc)
 		wipeTable(env.enemyDB.mods)
 		wipeTable(env.enemyDB.conditions)
 		wipeTable(env.enemyDB.multipliers)
+		if env.minion then
+			wipeTable(env.minion.modDB.mods)
+			wipeTable(env.minion.modDB.conditions)
+			wipeTable(env.minion.modDB.multipliers)
+		end
 
 		-- Call function to make modifications to the environment
-		modFunc(env, ...)
+		modFunc(env, override)
 		
 		-- Run calculation pass
-		calcs.perform(env)
-		fullDPS = calcs.calcFullDPS(build, "CALCULATOR", {}, { cachedPlayerDB = cachedPlayerDB, cachedEnemyDB = cachedEnemyDB, cachedMinionDB = cachedMinionDB, env = nil})
-		env.player.output.SkillDPS = fullDPS.skills
-		env.player.output.FullDPS = fullDPS.combinedDPS
-		env.player.output.FullDotDPS = fullDPS.TotalDotDPS
+		env.reportContext = useFullCalculatorPath and nil or buildReportContext(reportStat)
+		if useFullCalculatorPath then
+			calcs.perform(env)
+		else
+			calcs.perform(env, skipEHP)
+		end
+		if useFullDPS or useFullDPSOverride then
+			fullDPS = calcs.calcFullDPS(build, "CALCULATOR", {}, { cachedPlayerDB = cachedPlayerDB, cachedEnemyDB = cachedEnemyDB, cachedMinionDB = cachedMinionDB, env = nil }, false)
+			env.player.output.SkillDPS = fullDPS.skills
+			env.player.output.FullDPS = fullDPS.combinedDPS
+			env.player.output.FullDotDPS = fullDPS.TotalDotDPS
+		end
 
-		return env.player.output
+		return useFullCalculatorPath and env.player.output or buildReportOutput(env.player.output, reportStat)
 	end, baseOutput	
 end
 
 -- Get fast calculator for adding tree node modifiers
-function calcs.getNodeCalculator(build)
+function calcs.getNodeCalculator(build, reportStat)
 	return getCalculator(build, true, function(env, nodeList)
 		-- Build and merge modifiers for these nodes
 		env.modDB:AddList(calcs.buildModListForNodeList(env, nodeList))
-	end)
+	end, reportStat)
 end
 
 -- Get calculator for other changes (adding/removing nodes, items, gems, etc)
 function calcs.getMiscCalculator(build)
-	-- Run base calculation pass
 	local env, cachedPlayerDB, cachedEnemyDB, cachedMinionDB = calcs.initEnv(build, "CALCULATOR")
 	calcs.perform(env)
-	local fullDPS = calcs.calcFullDPS(build, "CALCULATOR", {}, { cachedPlayerDB = cachedPlayerDB, cachedEnemyDB = cachedEnemyDB, cachedMinionDB = cachedMinionDB, env = nil})
+	local fullDPS = calcs.calcFullDPS(build, "CALCULATOR", {}, { cachedPlayerDB = cachedPlayerDB, cachedEnemyDB = cachedEnemyDB, cachedMinionDB = cachedMinionDB, env = nil })
 	local usedFullDPS = #fullDPS.skills > 0
+	local baseOutput = env.player.output
+	local acceleratedEnv = nil
 	if usedFullDPS then
 		env.player.output.SkillDPS = fullDPS.skills
 		env.player.output.FullDPS = fullDPS.combinedDPS
 		env.player.output.FullDotDPS = fullDPS.TotalDotDPS
 	end
-	return function(override, useFullDPS)
-		local env, cachedPlayerDB, cachedEnemyDB, cachedMinionDB = calcs.initEnv(build, "CALCULATOR", override)
-		calcs.perform(env)
-		if (useFullDPS ~= false or build.viewMode == "TREE") and usedFullDPS then
+	return function(override, useFullDPS, reportStat)
+		if not reportStat or requiresFullCalculatorPath(reportStat) then
+			local env = calcs.initEnv(build, "CALCULATOR", override)
+			calcs.perform(env)
+			if (useFullDPS ~= false or build.viewMode == "TREE") and usedFullDPS then
+				local fullDPS = calcs.calcFullDPS(build, "CALCULATOR", override, { cachedPlayerDB = cachedPlayerDB, cachedEnemyDB = cachedEnemyDB, cachedMinionDB = cachedMinionDB, env = nil }, false)
+				env.player.output.SkillDPS = fullDPS.skills
+				env.player.output.FullDPS = fullDPS.combinedDPS
+				env.player.output.FullDotDPS = fullDPS.TotalDotDPS
+			end
+			return env.player.output
+		end
+		if useFullDPS and usedFullDPS then
+			local fullDPS = calcs.calcFullDPS(build, "CALCULATOR", override, { cachedPlayerDB = cachedPlayerDB, cachedEnemyDB = cachedEnemyDB, cachedMinionDB = cachedMinionDB, env = nil }, false)
+			return {
+				FullDPS = fullDPS.combinedDPS,
+				FullDotDPS = fullDPS.TotalDotDPS,
+			}
+		end
+		local env
+		local reportContext = buildReportContext(reportStat)
+		local reusedAcceleratedEnv = false
+		if not acceleratedEnv then
+			acceleratedEnv = calcs.initEnv(build, REPORT_MODE)
+		end
+		if canReuseReportOverride(override) then
+			env, cachedPlayerDB, cachedEnemyDB, cachedMinionDB = calcs.initEnv(build, REPORT_MODE, override, {
+				cachedPlayerDB = cachedPlayerDB,
+				cachedEnemyDB = cachedEnemyDB,
+				cachedMinionDB = cachedMinionDB,
+				env = acceleratedEnv,
+			})
+			acceleratedEnv = env
+			reusedAcceleratedEnv = true
+		else
+			env, cachedPlayerDB, cachedEnemyDB, cachedMinionDB = calcs.initEnv(build, REPORT_MODE, override)
+		end
+		env.reportContext = reportContext
+		env.forceRebuildSkillModLists = reusedAcceleratedEnv and (not reportContext or reportContext.needsOffence) and true or nil
+		calcs.perform(env, useFullDPS or not reportStatNeedsEHP(reportStat))
+		if useFullDPS ~= false and usedFullDPS then
 			-- prevent upcoming calculation from using Cached Data and thus forcing it to re-calculate new FullDPS roll-up 
 			-- without this, FullDPS increase/decrease when for node/item/gem comparison would be all 0 as it would be comparing
 			-- A with A (due to cache reuse) instead of A with B
-			local fullDPS = calcs.calcFullDPS(build, "CALCULATOR", override, { cachedPlayerDB = cachedPlayerDB, cachedEnemyDB = cachedEnemyDB, cachedMinionDB = cachedMinionDB, env = nil})
+			local fullDPS = calcs.calcFullDPS(build, "CALCULATOR", override, { cachedPlayerDB = cachedPlayerDB, cachedEnemyDB = cachedEnemyDB, cachedMinionDB = cachedMinionDB, env = nil }, false)
 			env.player.output.SkillDPS = fullDPS.skills
 			env.player.output.FullDPS = fullDPS.combinedDPS
 			env.player.output.FullDotDPS = fullDPS.TotalDotDPS
 		end
-		return env.player.output
-	end, env.player.output
+		return buildReportOutput(env.player.output, reportStat)
+	end, baseOutput
 end
 
 local function getActiveSkillCount(activeSkill)
@@ -173,14 +411,18 @@ local function getActiveSkillCount(activeSkill)
 	return 1, true
 end
 
-function calcs.calcFullDPS(build, mode, override, specEnv)
+function calcs.calcFullDPS(build, mode, override, specEnv, includeSkillList)
+	if includeSkillList == nil then
+		includeSkillList = true
+	end
 	local fullEnv, cachedPlayerDB, cachedEnemyDB, cachedMinionDB = calcs.initEnv(build, mode, override, specEnv)
 	local usedEnv = nil
+	fullEnv.fullDPSReportOnly = true
 
 	local fullDPS = {
 		combinedDPS = 0,
 		TotalDotDPS = 0,
-		skills = { },
+		skills = includeSkillList and { } or nil,
 		TotalPoisonDPS = 0,
 		causticGroundDPS = 0,
 		impaleDPS = 0,
@@ -192,6 +434,18 @@ function calcs.calcFullDPS(build, mode, override, specEnv)
 		dotDPS = 0,
 		cullingMulti = 0
 	}
+	local function addSkill(name, dps, count, trigger, skillPart, source)
+		if includeSkillList then
+			t_insert(fullDPS.skills, {
+				name = name,
+				dps = dps,
+				count = count,
+				trigger = trigger,
+				skillPart = skillPart,
+				source = source,
+			})
+		end
+	end
 
 	local bleedSource = ""
 	local corruptingBloodSource = ""
@@ -204,13 +458,17 @@ function calcs.calcFullDPS(build, mode, override, specEnv)
 			local activeSkillCount, enabled = getActiveSkillCount(activeSkill)
 			if enabled then
 				fullEnv.player.mainSkill = activeSkill
+				fullEnv.disableActiveSkillReuse = true
+				fullEnv.allowInactiveSkillReuse = true
 				calcs.perform(fullEnv, true)
 				usedEnv = fullEnv
 				local minionName = nil
 				if activeSkill.minion or usedEnv.minion then
 					if usedEnv.minion.output.TotalDPS and usedEnv.minion.output.TotalDPS > 0 then
-						minionName = (activeSkill.minion and activeSkill.minion.minionData.name..": ") or (usedEnv.minion and usedEnv.minion.minionData.name..": ") or ""
-						t_insert(fullDPS.skills, { name = activeSkill.activeEffect.grantedEffect.name, dps = usedEnv.minion.output.TotalDPS, count = activeSkillCount, trigger = activeSkill.infoTrigger, skillPart = minionName..activeSkill.skillPartName })
+						if includeSkillList then
+							minionName = (activeSkill.minion and activeSkill.minion.minionData.name..": ") or (usedEnv.minion and usedEnv.minion.minionData.name..": ") or ""
+						end
+						addSkill(activeSkill.activeEffect.grantedEffect.name, usedEnv.minion.output.TotalDPS, activeSkillCount, activeSkill.infoTrigger, minionName and minionName..activeSkill.skillPartName or nil)
 						fullDPS.combinedDPS = fullDPS.combinedDPS + usedEnv.minion.output.TotalDPS * activeSkillCount
 					end
 					if usedEnv.minion.output.BleedDPS and usedEnv.minion.output.BleedDPS > fullDPS.bleedDPS then
@@ -248,7 +506,7 @@ function calcs.calcFullDPS(build, mode, override, specEnv)
 				if activeSkill.mirage then
 					local mirageCount = (activeSkill.mirage.count or 1) * activeSkillCount
 					if activeSkill.mirage.output.TotalDPS and activeSkill.mirage.output.TotalDPS > 0 then
-						t_insert(fullDPS.skills, { name = activeSkill.mirage.name .. " (Mirage)", dps = activeSkill.mirage.output.TotalDPS, count = mirageCount, trigger = activeSkill.mirage.infoTrigger, skillPart = activeSkill.mirage.skillPartName })
+						addSkill(activeSkill.mirage.name .. " (Mirage)", activeSkill.mirage.output.TotalDPS, mirageCount, activeSkill.mirage.infoTrigger, activeSkill.mirage.skillPartName)
 						fullDPS.combinedDPS = fullDPS.combinedDPS + activeSkill.mirage.output.TotalDPS * mirageCount
 					end
 					if activeSkill.mirage.output.BleedDPS and activeSkill.mirage.output.BleedDPS > fullDPS.bleedDPS then
@@ -285,7 +543,7 @@ function calcs.calcFullDPS(build, mode, override, specEnv)
 				end
 
 				if usedEnv.player.output.TotalDPS and usedEnv.player.output.TotalDPS > 0 then
-					t_insert(fullDPS.skills, { name = activeSkill.activeEffect.grantedEffect.name, dps = usedEnv.player.output.TotalDPS, count = activeSkillCount, trigger = activeSkill.infoTrigger, skillPart = minionName and activeSkill.infoMessage2 or activeSkill.skillPartName })
+					addSkill(activeSkill.activeEffect.grantedEffect.name, usedEnv.player.output.TotalDPS, activeSkillCount, activeSkill.infoTrigger, minionName and activeSkill.infoMessage2 or activeSkill.skillPartName)
 					fullDPS.combinedDPS = fullDPS.combinedDPS + usedEnv.player.output.TotalDPS * activeSkillCount
 				end
 				if usedEnv.player.output.BleedDPS and usedEnv.player.output.BleedDPS > fullDPS.bleedDPS then
@@ -320,8 +578,9 @@ function calcs.calcFullDPS(build, mode, override, specEnv)
 				if usedEnv.player.output.TotalDot and usedEnv.player.output.TotalDot > 0 then
 					fullDPS.dotDPS = fullDPS.dotDPS + usedEnv.player.output.TotalDot * (activeSkill.skillFlags.DotCanStack and activeSkillCount or 1)
 				end
-				if usedEnv.player.output.CullMultiplier and usedEnv.player.output.CullMultiplier > 1 and usedEnv.player.output.CullMultiplier > fullDPS.cullingMulti then
-					fullDPS.cullingMulti = usedEnv.player.output.CullMultiplier
+				local currentPlayerCullMultiplier = usedEnv.player.output.CullMultiplier
+				if currentPlayerCullMultiplier and currentPlayerCullMultiplier > 1 and currentPlayerCullMultiplier > fullDPS.cullingMulti then
+					fullDPS.cullingMulti = currentPlayerCullMultiplier
 				end
 
 				-- Re-Build env calculator for new run
@@ -340,47 +599,47 @@ function calcs.calcFullDPS(build, mode, override, specEnv)
 	-- Re-Add ailment DPS components
 	fullDPS.TotalDotDPS = 0
 	if fullDPS.bleedDPS > 0 then
-		t_insert(fullDPS.skills, { name = "Best Bleed DPS", dps = fullDPS.bleedDPS, count = 1, source = bleedSource })
+		addSkill("Best Bleed DPS", fullDPS.bleedDPS, 1, nil, nil, bleedSource)
 		fullDPS.TotalDotDPS = fullDPS.TotalDotDPS + fullDPS.bleedDPS
 	end
 	if fullDPS.corruptingBloodDPS > 0 then
-		t_insert(fullDPS.skills, { name = "Corrupting Blood DPS", dps = fullDPS.corruptingBloodDPS, count = 1, source = corruptingBloodSource })
+		addSkill("Corrupting Blood DPS", fullDPS.corruptingBloodDPS, 1, nil, nil, corruptingBloodSource)
 		fullDPS.TotalDotDPS = fullDPS.TotalDotDPS + fullDPS.corruptingBloodDPS
 	end
 	if fullDPS.igniteDPS > 0 then
-		t_insert(fullDPS.skills, { name = "Best Ignite DPS", dps = fullDPS.igniteDPS, count = 1, source = igniteSource })
+		addSkill("Best Ignite DPS", fullDPS.igniteDPS, 1, nil, nil, igniteSource)
 		fullDPS.TotalDotDPS = fullDPS.TotalDotDPS + fullDPS.igniteDPS
 	end
 	if fullDPS.burningGroundDPS > 0 then
-		t_insert(fullDPS.skills, { name = "Best Burning Ground DPS", dps = fullDPS.burningGroundDPS, count = 1, source = burningGroundSource })
+		addSkill("Best Burning Ground DPS", fullDPS.burningGroundDPS, 1, nil, nil, burningGroundSource)
 		fullDPS.TotalDotDPS = fullDPS.TotalDotDPS + fullDPS.burningGroundDPS
 	end
 	if fullDPS.TotalPoisonDPS > 0 then
 		fullDPS.TotalPoisonDPS = m_min(fullDPS.TotalPoisonDPS, data.misc.DotDpsCap)
-		t_insert(fullDPS.skills, { name = "Full Poison DPS", dps = fullDPS.TotalPoisonDPS, count = 1 })
+		addSkill("Full Poison DPS", fullDPS.TotalPoisonDPS, 1)
 		fullDPS.TotalDotDPS = fullDPS.TotalDotDPS + fullDPS.TotalPoisonDPS
 	end
 	if fullDPS.causticGroundDPS > 0 then
-		t_insert(fullDPS.skills, { name = "Best Caustic Ground DPS", dps = fullDPS.causticGroundDPS, count = 1, source = causticGroundSource })
+		addSkill("Best Caustic Ground DPS", fullDPS.causticGroundDPS, 1, nil, nil, causticGroundSource)
 		fullDPS.TotalDotDPS = fullDPS.TotalDotDPS + fullDPS.causticGroundDPS
 	end
 	if fullDPS.impaleDPS > 0 then
-		t_insert(fullDPS.skills, { name = "Full Impale DPS", dps = fullDPS.impaleDPS, count = 1 })
+		addSkill("Full Impale DPS", fullDPS.impaleDPS, 1)
 		fullDPS.combinedDPS = fullDPS.combinedDPS + fullDPS.impaleDPS
 	end
 	if fullDPS.decayDPS > 0 then
-		t_insert(fullDPS.skills, { name = "Full Decay DPS", dps = fullDPS.decayDPS, count = 1 })
+		addSkill("Full Decay DPS", fullDPS.decayDPS, 1)
 		fullDPS.TotalDotDPS = fullDPS.TotalDotDPS + fullDPS.decayDPS
 	end
 	if fullDPS.dotDPS > 0 then
-		t_insert(fullDPS.skills, { name = "Full DoT DPS", dps = fullDPS.dotDPS, count = 1 })
+		addSkill("Full DoT DPS", fullDPS.dotDPS, 1)
 		fullDPS.TotalDotDPS = fullDPS.TotalDotDPS + fullDPS.dotDPS
 	end
 	fullDPS.TotalDotDPS = m_min(fullDPS.TotalDotDPS, data.misc.DotDpsCap)
 	fullDPS.combinedDPS = fullDPS.combinedDPS + fullDPS.TotalDotDPS
 	if fullDPS.cullingMulti > 0 then
 		fullDPS.cullingDPS = fullDPS.combinedDPS * (fullDPS.cullingMulti - 1)
-		t_insert(fullDPS.skills, { name = "Full Culling DPS", dps = fullDPS.cullingDPS, count = 1 })
+		addSkill("Full Culling DPS", fullDPS.cullingDPS, 1)
 		fullDPS.combinedDPS = fullDPS.combinedDPS + fullDPS.cullingDPS
 	end
 
