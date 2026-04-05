@@ -1215,6 +1215,264 @@ function PassiveTreeViewClass:AddNodeName(tooltip, node, build)
 	end
 end
 
+function PassiveTreeViewClass:CanShowSocketedJewelStats(jewel)
+	if not jewel or jewel.type ~= "Jewel" then
+		return false
+	end
+	if jewel.baseName == "Timeless Jewel" then
+		return true
+	end
+	for _, modList in ipairs({ jewel.enchantModLines, jewel.scourgeModLines, jewel.implicitModLines, jewel.explicitModLines, jewel.crucibleModLines }) do
+		for _, modLine in ipairs(modList) do
+			if modLine.line == "Grants all bonuses of Unallocated Small Passive Skills in Radius"
+			or modLine.line == "Grants all bonuses of Unallocated Notable Passive Skills in Radius" then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+function PassiveTreeViewClass:BuildSpecWithoutSocketedJewel(build, node)
+	local specState = build.spec:CreateUndoState()
+	local specWithoutJewel = new("PassiveSpec", build, build.spec.treeVersion)
+	specWithoutJewel.title = build.spec.title
+	specWithoutJewel.jewels = copyTable(build.spec.jewels)
+	specWithoutJewel:ImportFromNodeList(
+		specState.classId,
+		specState.ascendClassId,
+		specState.secondaryAscendClassId,
+		specState.hashList,
+		specState.hashOverrides,
+		specState.masteryEffects,
+		build.spec.treeVersion
+	)
+	specWithoutJewel.jewels[node.id] = 0
+	specWithoutJewel:BuildClusterJewelGraphs()
+	return specWithoutJewel
+end
+
+function PassiveTreeViewClass:IsSameConqueror(a, b)
+	return a and b
+		and a.id == b.id
+		and a.conqueror and b.conqueror
+		and a.conqueror.type == b.conqueror.type
+		and a.conqueror.id == b.conqueror.id
+end
+
+function PassiveTreeViewClass:IsMeaningfulJewelLine(line)
+	return line and line ~= "" and line ~= " "
+end
+
+function PassiveTreeViewClass:GetMeaningfulJewelLines(sd)
+	local lines = { }
+	for _, line in ipairs(sd or { }) do
+		if self:IsMeaningfulJewelLine(line) then
+			t_insert(lines, line)
+		end
+	end
+	return lines
+end
+
+function PassiveTreeViewClass:BuildJewelLineAggregate(line)
+	local segments = { }
+	local values = { }
+	local decimals = { }
+	local showPlus = { }
+	local pos = 1
+	while true do
+		local startIndex, endIndex, token = line:find("([%+%-]?%d+%.?%d*)", pos)
+		if not startIndex then
+			break
+		end
+		t_insert(segments, line:sub(pos, startIndex - 1))
+		t_insert(values, tonumber(token))
+		t_insert(decimals, #(token:match("%.(%d+)") or ""))
+		t_insert(showPlus, token:sub(1, 1) == "+")
+		pos = endIndex + 1
+	end
+	t_insert(segments, line:sub(pos))
+	return {
+		key = table.concat(segments, "\0"),
+		segments = segments,
+		values = values,
+		decimals = decimals,
+		showPlus = showPlus,
+		count = 1,
+		rawLine = line,
+	}
+end
+
+function PassiveTreeViewClass:MergeJewelLineAggregate(dst, src)
+	dst.count = dst.count + 1
+	for index, value in ipairs(src.values) do
+		dst.values[index] = (dst.values[index] or 0) + value
+		dst.decimals[index] = m_max(dst.decimals[index] or 0, src.decimals[index] or 0)
+		dst.showPlus[index] = dst.showPlus[index] or src.showPlus[index]
+	end
+end
+
+function PassiveTreeViewClass:FormatAggregatedJewelNumber(value, decimals, showPlus)
+	local text
+	if decimals and decimals > 0 then
+		text = string.format("%."..decimals.."f", value):gsub("0+$", ""):gsub("%.$", "")
+		if text == "-0" then
+			text = "0"
+		end
+	else
+		local intValue = value == m_floor(value) and m_floor(value) or value
+		text = tostring(intValue)
+	end
+	if showPlus and value > 0 and text:sub(1, 1) ~= "+" then
+		return "+" .. text
+	end
+	return text
+end
+
+function PassiveTreeViewClass:RenderJewelLineAggregate(aggregate)
+	if #aggregate.values == 0 then
+		return aggregate.count > 1 and string.format("%dx %s", aggregate.count, aggregate.rawLine) or aggregate.rawLine
+	end
+	local line = ""
+	for index, segment in ipairs(aggregate.segments) do
+		line = line .. segment
+		if aggregate.values[index] ~= nil then
+			line = line .. self:FormatAggregatedJewelNumber(aggregate.values[index], aggregate.decimals[index], aggregate.showPlus[index])
+		end
+	end
+	return line
+end
+
+function PassiveTreeViewClass:AddJewelSummaryLine(summary, nodeType, line)
+	local bucket = summary[nodeType]
+	local aggregate = self:BuildJewelLineAggregate(line)
+	if not bucket.lines[aggregate.key] then
+		bucket.lines[aggregate.key] = aggregate
+		t_insert(bucket.order, aggregate.key)
+	else
+		self:MergeJewelLineAggregate(bucket.lines[aggregate.key], aggregate)
+	end
+end
+
+function PassiveTreeViewClass:AddJewelSummaryNode(summary, nodeType, nodeName, lines)
+	local bucket = summary[nodeType]
+	bucket.count = bucket.count + 1
+	if nodeName and not bucket.names[nodeName] then
+		bucket.names[nodeName] = true
+		t_insert(bucket.nameOrder, nodeName)
+	end
+	for _, line in ipairs(lines) do
+		self:AddJewelSummaryLine(summary, nodeType, line)
+	end
+end
+
+function PassiveTreeViewClass:GetChangedJewelNodeLines(beforeNode, afterNode)
+	local beforeLineCounts = { }
+	for _, line in ipairs(self:GetMeaningfulJewelLines(beforeNode and beforeNode.sd)) do
+		beforeLineCounts[line] = (beforeLineCounts[line] or 0) + 1
+	end
+	local afterLines = self:GetMeaningfulJewelLines(afterNode and afterNode.sd)
+	if beforeNode and beforeNode.dn ~= afterNode.dn then
+		return afterLines
+	end
+	local diff = { }
+	for _, line in ipairs(afterLines) do
+		if (beforeLineCounts[line] or 0) > 0 then
+			beforeLineCounts[line] = beforeLineCounts[line] - 1
+		else
+			t_insert(diff, line)
+		end
+	end
+	return diff
+end
+
+function PassiveTreeViewClass:AddGrantedUnallocatedPassiveStats(summary, jewel, radiusNodes, currentSpec, specWithoutJewel)
+	local wantedTypes = { }
+	for _, modList in ipairs({ jewel.enchantModLines, jewel.scourgeModLines, jewel.implicitModLines, jewel.explicitModLines, jewel.crucibleModLines }) do
+		for _, modLine in ipairs(modList) do
+			if modLine.line == "Grants all bonuses of Unallocated Small Passive Skills in Radius" then
+				wantedTypes["Normal"] = true
+			elseif modLine.line == "Grants all bonuses of Unallocated Notable Passive Skills in Radius" then
+				wantedTypes["Notable"] = true
+			end
+		end
+	end
+	if not next(wantedTypes) then
+		return
+	end
+	for nodeId in pairs(radiusNodes or { }) do
+		local beforeNode = specWithoutJewel.nodes[nodeId]
+		local currentNode = currentSpec.nodes[nodeId]
+		if beforeNode and currentNode
+		and not currentNode.alloc
+		and wantedTypes[currentNode.type] then
+			local lines = self:GetMeaningfulJewelLines(beforeNode.sd)
+				if #lines > 0 then
+					self:AddJewelSummaryNode(summary, currentNode.type, nil, lines)
+				end
+			end
+		end
+	end
+
+function PassiveTreeViewClass:AddSocketedJewelTooltipStats(tooltip, node, jewel, build)
+	if not self:CanShowSocketedJewelStats(jewel) then
+		return
+	end
+
+	local currentSpec = build.spec
+	local grantedPassives = build.calcsTab.mainEnv.grantedPassives
+	local socketNode = currentSpec.nodes[node.id]
+	local radiusNodes = socketNode and socketNode.nodesInRadius and socketNode.nodesInRadius[jewel.jewelRadiusIndex]
+	if not radiusNodes then
+		return
+	end
+
+	local specWithoutJewel = self:BuildSpecWithoutSocketedJewel(build, node)
+	local summary = {
+		Normal = { label = "Passive Skills", count = 0, lines = { }, order = { }, names = { }, nameOrder = { } },
+		Notable = { label = "Notable Skills", count = 0, lines = { }, order = { }, names = { }, nameOrder = { } },
+		Keystone = { label = "Keystones", count = 0, lines = { }, order = { }, names = { }, nameOrder = { } },
+	}
+
+	if jewel.jewelData and jewel.jewelData.conqueredBy then
+		for nodeId in pairs(radiusNodes) do
+			local beforeNode = specWithoutJewel.nodes[nodeId]
+			local afterNode = currentSpec.nodes[nodeId]
+			if beforeNode and afterNode
+			and (afterNode.alloc or grantedPassives[nodeId])
+			and summary[afterNode.type]
+			and self:IsSameConqueror(afterNode.conqueredBy, jewel.jewelData.conqueredBy) then
+				local lines = self:GetChangedJewelNodeLines(beforeNode, afterNode)
+				if #lines > 0 then
+					self:AddJewelSummaryNode(summary, afterNode.type, afterNode.type == "Keystone" and beforeNode.dn ~= afterNode.dn and afterNode.dn or nil, lines)
+				end
+			end
+		end
+	end
+
+	self:AddGrantedUnallocatedPassiveStats(summary, jewel, radiusNodes, currentSpec, specWithoutJewel)
+
+	local totalChanged = summary.Normal.count + summary.Notable.count + summary.Keystone.count
+	if totalChanged == 0 then
+		return
+	end
+
+	tooltip:AddSeparator(14)
+	tooltip:AddLine(14, "^7Changed passives from this jewel:")
+	for _, nodeType in ipairs({ "Normal", "Notable", "Keystone" }) do
+		local bucket = summary[nodeType]
+		if bucket.count > 0 then
+			tooltip:AddLine(14, string.format("^7%s: %d", bucket.label, bucket.count))
+			if nodeType == "Keystone" and bucket.nameOrder[1] then
+				tooltip:AddLine(14, "^8" .. table.concat(bucket.nameOrder, "^7, ^8"))
+			end
+			for _, lineKey in ipairs(bucket.order) do
+				tooltip:AddLine(14, colorCodes.MAGIC .. self:RenderJewelLineAggregate(bucket.lines[lineKey]))
+			end
+		end
+	end
+end
+
 function PassiveTreeViewClass:AddNodeTooltip(tooltip, node, build)
 	local fontSizeBig = main.showFlavourText and 18 or 16
 	tooltip.center = true
@@ -1224,6 +1482,7 @@ function PassiveTreeViewClass:AddNodeTooltip(tooltip, node, build)
 		local socket, jewel = build.itemsTab:GetSocketAndJewelForNodeID(node.id)
 		if jewel then
 			build.itemsTab:AddItemTooltip(tooltip, jewel, { nodeId = node.id })
+			self:AddSocketedJewelTooltipStats(tooltip, node, jewel, build)
 			if node.distanceToClassStart and node.distanceToClassStart > 0 then
 				tooltip:AddSeparator(14)
 				tooltip:AddLine(16, string.format("^7Distance to start: %d", node.distanceToClassStart))
