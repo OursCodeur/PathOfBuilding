@@ -3088,7 +3088,7 @@ c["120% increased Energy Shield"]={{[1]={flags=0,keywordFlags=0,name="EnergyShie
 c["120% increased Evasion Rating"]={{[1]={flags=0,keywordFlags=0,name="Evasion",type="INC",value=120}},nil}
 c["120% increased Evasion and Energy Shield"]={{[1]={flags=0,keywordFlags=0,name="EvasionAndEnergyShield",type="INC",value=120}},nil}
 c["120% increased Frenzy Charge Duration"]={{[1]={flags=0,keywordFlags=0,name="FrenzyChargesDuration",type="INC",value=120}},nil}
-c["120% increased Implicit Modifier magnitudes"]={{}," Implicit Modifier magnitudes "}
+c["120% increased Implicit Modifier magnitudes"]={{[1]={flags=0,keywordFlags=0,name="ImplicitModifierMagnitudes",type="INC",value=120}},nil}
 c["120% increased Implicit Modifier magnitudes 20% increased Cast Speed"]={{[1]={flags=16,keywordFlags=0,name="Speed",type="INC",value=120}}," Implicit Modifier magnitudes 20% increased  "}
 c["120% increased Physical Damage"]={{[1]={flags=0,keywordFlags=0,name="PhysicalDamage",type="INC",value=120}},nil}
 c["120% increased Power Charge Duration"]={{[1]={flags=0,keywordFlags=0,name="PowerChargesDuration",type="INC",value=120}},nil}
@@ -6567,8 +6567,8 @@ c["90% increased Power Charge Duration"]={{[1]={flags=0,keywordFlags=0,name="Pow
 c["90% increased Rarity of Items found"]={{[1]={flags=0,keywordFlags=0,name="LootRarity",type="INC",value=90}},nil}
 c["90% increased Rarity of Items found with a Normal Item equipped"]={{[1]={[1]={threshold=1,type="MultiplierThreshold",var="NormalItem"},flags=0,keywordFlags=0,name="LootRarity",type="INC",value=90}},nil}
 c["90% increased Spell Damage"]={{[1]={flags=2,keywordFlags=0,name="Damage",type="INC",value=90}},nil}
-c["90% increased Unveiled Modifier magnitudes"]={{}," Unveiled Modifier magnitudes "}
-c["90% increased Unveiled Modifier magnitudes 188% increased Chaos Damage"]={{[1]={flags=0,keywordFlags=0,name="ChaosDamage",type="INC",value=90}}," Unveiled Modifier magnitudes 188% increased  "}
+c["90% increased Unveiled Modifier magnitudes"]={{[1]={flags=0,keywordFlags=0,name="UnveiledModifierMagnitudes",type="INC",value=90}},nil}
+c["90% increased Unveiled Modifier magnitudes 188% increased Chaos Damage"]={{[1]={flags=0,keywordFlags=0,name="UnveiledModifierMagnitudes",type="INC",value=90},[2]={flags=0,keywordFlags=0,name="ChaosDamage",type="INC",value=188}},nil}
 c["90% less Power Charge Duration"]={{[1]={flags=0,keywordFlags=0,name="PowerChargesDuration",type="MORE",value=-90}},nil}
 c["90% of Damage taken Recouped as Life"]={{[1]={flags=0,keywordFlags=0,name="LifeRecoup",type="BASE",value=90}},nil}
 c["90% reduced Duration"]={{[1]={flags=0,keywordFlags=0,name="Duration",type="INC",value=-90}},nil}
@@ -9533,8 +9533,8 @@ c["Impales removed this way multiply their Reflected Damage for this Hit by the 
 c["Impales you inflict gain 50% increased Effect once 1 second of Duration has expired"]={nil,"Impales you inflict gain 50% increased Effect once 1 second of Duration has expired "}
 c["Impales you inflict last 1 additional Hit"]={{[1]={flags=0,keywordFlags=0,name="ImpaleStacksMax",type="BASE",value=1}},nil}
 c["Impales you inflict last 2 additional Hits while using Pride"]={{[1]={[1]={type="Condition",var="AffectedByPride"},flags=0,keywordFlags=0,name="ImpaleStacksMax",type="BASE",value=2}},nil}
-c["Implicit Modifier magnitudes are doubled"]={{},"Implicit Modifier magnitudes are d "}
-c["Implicit Modifier magnitudes are tripled"]={nil,"Implicit Modifier magnitudes are tripled "}
+c["Implicit Modifier magnitudes are doubled"]={{[1]={flags=0,keywordFlags=0,name="ImplicitModifierMagnitudes",type="INC",value=100}},nil}
+c["Implicit Modifier magnitudes are tripled"]={{[1]={flags=0,keywordFlags=0,name="ImplicitModifierMagnitudes",type="INC",value=200}},nil}
 c["Implicit Modifier magnitudes are tripled Corrupted"]={nil,"Implicit Modifier magnitudes are tripled Corrupted "}
 c["Implicit Modifiers Cannot Be Changed"]={{},nil}
 c["Increase to Cast Speed from Arcane Surge also applies to Movement Speed"]={{[1]={flags=0,keywordFlags=0,name="ArcaneSurgeCastSpeedToMovementSpeed",type="FLAG",value=true}},nil}

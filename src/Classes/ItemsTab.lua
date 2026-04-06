@@ -60,6 +60,54 @@ local function isAnointable(item)
 	return (item.canBeAnointed or item.base.type == "Amulet")
 end
 
+local function shouldFlipAffixRange(modA, modB)
+	local function getMinMax(mod)
+		for _, line in ipairs(mod) do
+			local min, max = line:match("%((%d[%d%.]*)%-(%d[%d%.]*)%)")
+			if min and max then
+				return tonumber(min), tonumber(max)
+			end
+		end
+	end
+
+	local minA, maxA = getMinMax(modA)
+	local minB, maxB = getMinMax(modB)
+	if not minA or not minB or not maxA or not maxB then
+		return false
+	end
+
+	local allInts = minA == m_floor(minA) and maxA == m_floor(maxA) and minB == m_floor(minB) and maxB == m_floor(maxB)
+	if not allInts then
+		return false
+	end
+
+	if minA < minB then
+		return minA + 1 == maxB
+	else
+		return minA - 1 == maxB
+	end
+end
+
+local function getItemAffix(item, modId)
+	return item and modId and item.GetAffix and item:GetAffix(modId) or nil
+end
+
+local function mapAffixRangeForControl(item, drop, index, range)
+	local priorMod = index - 1 > 0 and getItemAffix(item, drop.list[drop.selIndex].modList[index - 1]) or nil
+	local currentMod = getItemAffix(item, drop.list[drop.selIndex].modList[index])
+	local nextMod = index + 1 < #drop.list[drop.selIndex].modList and getItemAffix(item, drop.list[drop.selIndex].modList[index + 1]) or nil
+	if priorMod then
+		if shouldFlipAffixRange(priorMod, currentMod) then
+			return 1 - range
+		end
+	elseif nextMod then
+		if shouldFlipAffixRange(currentMod, nextMod) then
+			return 1 - range
+		end
+	end
+	return range
+end
+
 local ItemsTabClass = newClass("ItemsTab", "UndoHandler", "ControlHost", "Control", function(self, build)
 	self.UndoHandler()
 	self.ControlHost()
@@ -666,56 +714,21 @@ holding Shift will put it in the second.]])
 	for i = 1, 6 do
 		local prev = self.controls["displayItemAffix"..(i-1)] or self.controls.displayItemSectionAffix
 		local drop, slider
-		local function verifyRange(range, index, drop) -- flips range if it will form discontinuous values
-			local priorMod = index - 1 > 0 and self.displayItem.affixes[drop.list[drop.selIndex].modList[index - 1]] or nil
-			local nextMod = index + 1 < #drop.list[drop.selIndex].modList and self.displayItem.affixes[drop.list[drop.selIndex].modList[index + 1]] or nil
-			local function flipRange(modA, modB) -- assumes all pairs are ordered the same
-				local function getMinMax(mod) -- gets first valid range from a mod
-					for _, line in ipairs(mod) do
-						local min, max = line:match("%((%d[%d%.]*)%-(%d[%d%.]*)%)")
-						if min and max then return tonumber(min), tonumber(max)	end
-					end
-				end
-
-				local minA, maxA = getMinMax(modA)
-				local minB, maxB = getMinMax(modB)
-
-				if not minA or not minB or not maxA or not maxB then
-					return false
-				end
-
-				local allInts = minA == m_floor(minA) and maxA == m_floor(maxA) and minB == m_floor(minB) and maxB == m_floor(maxB) -- if the mod goes in steps that aren't 1, then the code below this doesn't work
-				if (minA and minB and maxA and maxB and allInts) then
-					if (minA < minB) then -- ascending
-						return minA + 1 == maxB
-					else -- descending
-						return minA - 1 == maxB
-					end
-				end
-				return false
-			end
-			
-			if priorMod then
-				if flipRange(priorMod, self.displayItem.affixes[drop.list[drop.selIndex].modList[index]]) then
-					range = 1 - range
-				end
-			elseif nextMod then
-				if flipRange(self.displayItem.affixes[drop.list[drop.selIndex].modList[index]], nextMod) then
-					range = 1 - range
-				end
-			end
-			return range
+		local function verifyRange(range, index, drop)
+			return mapAffixRangeForControl(self.displayItem, drop, index, range)
 		end
 		drop = new("DropDownControl", {"TOPLEFT",prev,"TOPLEFT"}, {i==1 and 40 or 0, 0, 418, 20}, nil, function(index, value)
 			local affix = { modId = "None" }
 			if value.modId then
 				affix.modId = value.modId
 				affix.range = slider.val
+				affix.displayLines = nil
 			elseif value.modList then
 				slider.divCount = #value.modList
 				local index, range = slider:GetDivVal()
 				affix.modId = value.modList[index]
 				affix.range = verifyRange(range, index, drop)
+				affix.displayLines = nil
 			end
 			self.displayItem[drop.outputTable][drop.outputIndex] = affix
 			self.displayItem:Craft()
@@ -731,7 +744,7 @@ holding Shift will put it in the second.]])
 				tooltip:Clear()
 			elseif tooltip:CheckForUpdate(modList) then
 				if value.modId or #modList == 1 then
-					local mod = self.displayItem.affixes[value.modId or modList[1]]
+					local mod = getItemAffix(self.displayItem, value.modId or modList[1])
 					tooltip:AddLine(16, "^7Affix: "..mod.affix)
 					for _, line in ipairs(mod) do
 						tooltip:AddLine(14, "^7"..line)
@@ -744,8 +757,8 @@ holding Shift will put it in the second.]])
 					end
 				else
 					tooltip:AddLine(16, "^7"..#modList.." Tiers")
-					local minMod = self.displayItem.affixes[modList[1]]
-					local maxMod = self.displayItem.affixes[modList[#modList]]
+					local minMod = getItemAffix(self.displayItem, modList[1])
+					local maxMod = getItemAffix(self.displayItem, modList[#modList])
 					for l, line in ipairs(minMod) do
 						local minLine = line:gsub("%((%d[%d%.]*)%-(%d[%d%.]*)%)", "%1")
 						local maxLine = maxMod[l]:gsub("%((%d[%d%.]*)%-(%d[%d%.]*)%)", "%2")
@@ -770,7 +783,7 @@ holding Shift will put it in the second.]])
 						tooltip:AddLine(16, "Tags: "..table.concat(maxMod.modTags, ', '))
 					end
 				end
-				local mod = self.displayItem.affixes[value.modId or modList[1]]
+				local mod = getItemAffix(self.displayItem, value.modId or modList[1])
 				local notableName = mod[1] and mod[1]:match("1 Added Passive Skill is (.*)")
 				local node = notableName and self.build.spec.tree.clusterNodeMap[notableName]
 				if node then
@@ -828,9 +841,9 @@ holding Shift will put it in the second.]])
 				else
 					local mod = { }
 					if value.modId or #modList == 1 then
-						mod = self.displayItem.affixes[value.modId or modList[1]]
+						mod = getItemAffix(self.displayItem, value.modId or modList[1])
 					else
-						mod = self.displayItem.affixes[modList[1 + round((#modList - 1) * main.defaultItemAffixQuality)]]
+						mod = getItemAffix(self.displayItem, modList[1 + round((#modList - 1) * main.defaultItemAffixQuality)])
 					end
 					
 					-- Adding Mod
@@ -847,6 +860,7 @@ holding Shift will put it in the second.]])
 			affix.modId = drop.list[drop.selIndex].modList[index]
 
 			affix.range = verifyRange(range, index, drop)
+			affix.displayLines = nil
 			self.displayItem:Craft()
 			self:UpdateDisplayItemTooltip()
 		end)
@@ -861,7 +875,7 @@ holding Shift will put it in the second.]])
 				local index, range = slider:GetDivVal(val)
 				range = verifyRange(range, index, drop)
 				local modId = modList[index]
-				local mod = self.displayItem.affixes[modId]
+				local mod = getItemAffix(self.displayItem, modId)
 				for _, line in ipairs(mod) do
 					tooltip:AddLine(16, itemLib.applyRange(line, range))
 				end
@@ -934,6 +948,7 @@ holding Shift will put it in the second.]])
 	self.controls.displayItemRangeSlider = new("SliderControl", {"LEFT",self.controls.displayItemRangeLine,"RIGHT"}, {8, 0, 100, 18}, function(val)
 		self.displayItem.rangeLineList[self.controls.displayItemRangeLine.selIndex].range = val
 		self.displayItem:BuildAndParseRaw()
+		self:UpdateDisplayItemRangeLines()
 		self:UpdateDisplayItemTooltip()
 		self:UpdateCustomControls()
 	end)
@@ -941,16 +956,17 @@ holding Shift will put it in the second.]])
 	for i = 1, 20 do
 		local baseControl = i == 1 and self.controls.displayItemSectionRange or self.controls["displayItemStackedRangeSlider"..(i-1)]
 
-		self.controls["displayItemStackedRangeSlider"..i] = new("SliderControl", {"TOPLEFT",baseControl,"TOPLEFT"}, {0, function()
-			return i == 1 and 2 or 22
-		end, 100, 18}, function(val)
-			if self.displayItem and self.displayItem.rangeLineList[i] then
-				self.displayItem.rangeLineList[i].range = val
-				self.displayItem:BuildAndParseRaw()
-				self:UpdateDisplayItemTooltip()
-				self:UpdateCustomControls()
-			end
-		end)
+			self.controls["displayItemStackedRangeSlider"..i] = new("SliderControl", {"TOPLEFT",baseControl,"TOPLEFT"}, {0, function()
+				return i == 1 and 2 or 22
+			end, 100, 18}, function(val)
+				if self.displayItem and self.displayItem.rangeLineList[i] then
+					self.displayItem.rangeLineList[i].range = val
+					self.displayItem:BuildAndParseRaw()
+					self:UpdateDisplayItemRangeLines()
+					self:UpdateDisplayItemTooltip()
+					self:UpdateCustomControls()
+				end
+			end)
 		self.controls["displayItemStackedRangeLine"..i] = new("LabelControl", {"LEFT",self.controls["displayItemStackedRangeSlider"..i],"RIGHT"}, {8, -2, 350, 14}, function()
 			if self.displayItem and self.displayItem.rangeLineList[i] then
 				return "^7" .. self.displayItem.rangeLineList[i].line
@@ -1240,11 +1256,6 @@ function ItemsTabClass:Draw(viewPort, inputEvents)
 		if event.type == "KeyDown" then	
 			if event.key == "v" and IsKeyDown("CTRL") then
 				local newItem = Paste()
-				if newItem:find("{ ", 0, true) then
-					main:OpenConfirmPopup("Warning", "\"Advanced Item Descriptions\" (Ctrl+Alt+c) are unsupported.\n\nAbort paste?", "OK", function()
-						self:SetDisplayItem()
-					end)
-				end
 				if newItem then
 					self:CreateDisplayItemFromRaw(newItem, true)
 				end
@@ -1796,7 +1807,7 @@ function ItemsTabClass:UpdateAffixControl(control, item, type, outputTable, outp
 	for _, table in ipairs({"prefixes","suffixes"}) do
 		for index = 1, (item[table].limit or (item.affixLimit / 2)) do
 			if index ~= outputIndex or table ~= outputTable then
-				local mod = item.affixes[item[table][index] and item[table][index].modId]
+				local mod = getItemAffix(item, item[table][index] and item[table][index].modId)
 				if mod then
 					if mod.group then
 						excludeGroups[mod.group] = true
@@ -1820,7 +1831,7 @@ function ItemsTabClass:UpdateAffixControl(control, item, type, outputTable, outp
 	local affixList = { }
 	local retainedAffixes = { }
 	for modId, mod in pairs(item.affixes) do
-		if mod.type == type and not excludeGroups[mod.group] and not item:CheckIfModIsDelve(mod) then
+		if mod.type == type and not excludeGroups[mod.group] and not item:CheckIfModUsesSpecialSource(mod) then
 			if item:GetModSpawnWeight(mod, extraTags) > 0 then
 				t_insert(affixList, modId)
 			elseif modId == selAffix then
@@ -1830,8 +1841,8 @@ function ItemsTabClass:UpdateAffixControl(control, item, type, outputTable, outp
 		end
 	end
 	table.sort(affixList, function(a, b)
-		local modA = item.affixes[a]
-		local modB = item.affixes[b]
+		local modA = getItemAffix(item, a)
+		local modB = getItemAffix(item, b)
 		for i = 1, m_max(#modA, #modB) do
 			if not modA[i] then
 				return true
@@ -1855,7 +1866,7 @@ function ItemsTabClass:UpdateAffixControl(control, item, type, outputTable, outp
 	local selAffix = item[outputTable][outputIndex].modId
 	if (item.type == "Jewel" and item.base.subType ~= "Abyss") then
 		for i, modId in pairs(affixList) do
-			local mod = item.affixes[modId]
+			local mod = getItemAffix(item, modId)
 			if selAffix == modId then
 				control.selIndex = i + 1
 			end
@@ -1876,7 +1887,7 @@ function ItemsTabClass:UpdateAffixControl(control, item, type, outputTable, outp
 	else
 		local lastSeries
 		for _, modId in ipairs(affixList) do
-			local mod = item.affixes[modId]
+			local mod = getItemAffix(item, modId)
 			if not lastSeries or not tableDeepEquals(lastSeries.statOrder, mod.statOrder) then
 				local modString = table.concat(mod, "/")
 				lastSeries = {
@@ -1899,7 +1910,10 @@ function ItemsTabClass:UpdateAffixControl(control, item, type, outputTable, outp
 	end
 	if control.list[control.selIndex].haveRange then
 		control.slider.divCount = #control.list[control.selIndex].modList
-		control.slider.val = (isValueInArray(control.list[control.selIndex].modList, selAffix) - 1 + (item[outputTable][outputIndex].range or 0.5)) / control.slider.divCount
+		local index = isValueInArray(control.list[control.selIndex].modList, selAffix)
+		local range = item[outputTable][outputIndex].range or 0.5
+		range = mapAffixRangeForControl(item, control, index, range)
+		control.slider.val = (index - 1 + range) / control.slider.divCount
 		if control.slider.divCount == 1 then
 			control.slider.divCount = nil
 		end
@@ -1987,7 +2001,9 @@ function ItemsTabClass:AddModComparisonTooltip(tooltip, mod)
 	local newItem = new("Item", self.displayItem:BuildRaw())
 	
 	for _, subMod in ipairs(mod) do
-		t_insert(newItem.explicitModLines, { line = checkLineForAllocates(subMod, self.build.spec.nodes), modTags = mod.modTags, [mod.type] = true })
+		local line = checkLineForAllocates(subMod, self.build.spec.nodes)
+		local modList, extra = modLib.parseMod(line)
+		t_insert(newItem.explicitModLines, { line = line, modTags = mod.modTags, modList = modList or { }, extra = extra, [mod.type] = true })
 	end
 
 	newItem:BuildAndParseRaw()
@@ -2687,7 +2703,10 @@ function ItemsTabClass:AddCustomModifierToDisplayItem()
 			for _, modLine in ipairs({ self.displayItem.prefixes, self.displayItem.suffixes }) do
 				for i = 1, (modLine.limit or (self.displayItem.affixLimit / 2)) do
 					if modLine[i] and modLine[i].modId ~= "None" then
-						excludeGroups[self.displayItem.affixes[modLine[i].modId].group] = true
+						local mod = getItemAffix(self.displayItem, modLine[i].modId)
+						if mod then
+							excludeGroups[mod.group] = true
+						end
 					end
 				end
 			end

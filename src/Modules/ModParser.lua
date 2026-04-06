@@ -2079,7 +2079,18 @@ local specialModList = {
 		return explodeFunc(100, amount, type, { type = "ActorCondition", actor = "enemy", var = "Burning" })
 	end,
 	["non-aura curses you inflict are not removed from dying enemies"] = {},
-	["enemies near corpses affected by your curses are blinded"] = { mod("EnemyModifier", "LIST", { mod = flag("Condition:Blinded") }, { type = "MultiplierThreshold", var = "NearbyCorpse", threshold = 1 }, { type = "ActorCondition", actor = "enemy", var = "Cursed" }) },
+	["([%+%-]?[%d%.]+)%% increased implicit modifier magnitudes"] = function(num)
+		return { mod("ImplicitModifierMagnitudes", "INC", num) }
+	end,
+	["([%+%-]?[%d%.]+)%% reduced implicit modifier magnitudes"] = function(num)
+		return { mod("ImplicitModifierMagnitudes", "INC", -num) }
+	end,
+	["implicit modifier magnitudes are doubled"] = { mod("ImplicitModifierMagnitudes", "INC", 100) },
+	["implicit modifier magnitudes are tripled"] = { mod("ImplicitModifierMagnitudes", "INC", 200) },
+	["([%+%-]?[%d%.]+)%% increased unveiled modifier magnitudes"] = function(num)
+		return { mod("UnveiledModifierMagnitudes", "INC", num) }
+	end,
+		["enemies near corpses affected by your curses are blinded"] = { mod("EnemyModifier", "LIST", { mod = flag("Condition:Blinded") }, { type = "MultiplierThreshold", var = "NearbyCorpse", threshold = 1 }, { type = "ActorCondition", actor = "enemy", var = "Cursed" }) },
 	["enemies killed near corpses affected by your curses explode, dealing (%d+)%% of their life as (.+) damage"] = function(amount, _, type)	-- Asenath's Gentle Touch
 		return explodeFunc(100, amount, type, { type = "MultiplierThreshold", var = "NearbyCorpse", threshold = 1 }, { type = "ActorCondition", actor = "enemy", var = "Cursed" })
 	end,
@@ -5694,6 +5705,8 @@ specialModList = { }
 for k, v in pairs(oldList) do
 	specialModList["^"..k.."$"] = v
 end
+specialModList["^implicit modifier magnitudes are doubled$"] = { mod("ImplicitModifierMagnitudes", "INC", 100) }
+specialModList["^implicit modifier magnitudes are tripled$"] = { mod("ImplicitModifierMagnitudes", "INC", 200) }
 
 -- Modifiers that are recognised but unsupported
 local unsupportedModList = {

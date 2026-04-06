@@ -71,6 +71,8 @@ end
 local lineFlags = {
 	["crafted"] = true, ["crucible"] = true, ["custom"] = true, ["eater"] = true, ["enchant"] = true,
 	["exarch"] = true, ["fractured"] = true, ["implicit"] = true, ["scourge"] = true, ["synthesis"] = true,
+	["specialSource"] = true, ["veiled"] = true,
+	["unscalable"] = true,
 	["mutated"] = true
 }
 
@@ -287,6 +289,867 @@ local function specToNumber(s)
 	return n and tonumber(n)
 end
 
+local function parseModLineText(line, range, valueScalar)
+	local hasRangedText = range ~= nil and line:find("%((%-?%d+%.?%d*)%-(%-?%d+%.?%d*)%)") ~= nil
+	local parsedLine = (range ~= nil and hasRangedText) and itemLib.applyRange(line, range, valueScalar) or line
+	return modLib.parseMod(parsedLine)
+end
+
+local beastCraftAffixLookup = { }
+for _, mod in pairs(data.beastCraft or { }) do
+	if mod.affix and mod.affix ~= "" then
+		beastCraftAffixLookup[mod.affix] = true
+	end
+end
+
+local veiledAffixLookup = { }
+for _, mod in pairs(data.veiledMods or { }) do
+	if mod.affix and mod.affix ~= "" then
+		veiledAffixLookup[mod.affix] = true
+	end
+end
+
+local advancedClipboardSpecialSourceDefs = {
+	{
+		id = "BEASTCRAFT",
+		matchesAffix = function(affix)
+			return beastCraftAffixLookup[affix] or false
+		end,
+		pool = function()
+			return data.beastCraft or { }
+		end,
+	},
+	{
+		id = "VEILED",
+		matchesAffix = function(affix)
+			return veiledAffixLookup[affix] or false
+		end,
+		matchesMod = function(mod)
+			if veiledAffixLookup[mod.affix] then
+				return true
+			end
+			for _, tag in ipairs(mod.modTags or { }) do
+				if tag == "unveiled_mod" then
+					return true
+				end
+			end
+			return false
+		end,
+		pool = function()
+			return data.veiledMods or { }
+		end,
+	},
+	{
+		id = "ESSENCE",
+		matchesAffix = function(affix)
+			return affix == "Essences" or affix == "of the Essence"
+		end,
+	},
+	{
+		id = "DELVE",
+		matchesAffix = function(affix)
+			return affix == "Subterranean" or affix == "of the Underground"
+		end,
+	},
+}
+
+local function getAdvancedClipboardSpecialSource(groupOrAffix)
+	local affix = type(groupOrAffix) == "table" and groupOrAffix.affix or groupOrAffix
+	if not affix then
+		return
+	end
+	for _, sourceDef in ipairs(advancedClipboardSpecialSourceDefs) do
+		if sourceDef.matchesAffix(affix) then
+			return sourceDef
+		end
+	end
+end
+
+local function getAdvancedClipboardSpecialSourceById(sourceId)
+	for _, sourceDef in ipairs(advancedClipboardSpecialSourceDefs) do
+		if sourceDef.id == sourceId then
+			return sourceDef
+		end
+	end
+end
+
+local function getFallbackAffixPools(item)
+	return {
+		item and item.affixes,
+		data.veiledMods,
+		data.beastCraft,
+		data.masterMods,
+	}
+end
+
+local function getFallbackAffix(item, modId)
+	if not modId then
+		return
+	end
+	for _, pool in ipairs(getFallbackAffixPools(item)) do
+		if pool and pool[modId] then
+			return pool[modId]
+		end
+	end
+end
+
+local function parseAdvancedClipboardDescriptor(line)
+	local body = line:match("^%{%s*(.-)%s*%}$")
+	if not body or not body:find(" Modifier", 1, true) then
+		return
+	end
+	local group = {
+		type = "Other",
+		affix = body:match('Modifier%s+"([^"]+)"'),
+		tier = tonumber(body:match("%(Tier:%s*(%d+)%)")),
+		lines = { },
+	}
+	if body:find("Prefix Modifier", 1, true) then
+		group.type = "Prefix"
+	elseif body:find("Suffix Modifier", 1, true) then
+		group.type = "Suffix"
+	elseif body:find("Implicit Modifier", 1, true) then
+		group.type = "Implicit"
+	end
+	group.crafted = body:find("Master Crafted", 1, true) ~= nil
+	group.fractured = body:find("Fractured", 1, true) ~= nil
+	group.exarch = body:find("Searing Exarch", 1, true) ~= nil
+	group.eater = body:find("Eater of Worlds", 1, true) ~= nil
+	group.veiled = group.affix and veiledAffixLookup[group.affix] or nil
+	local increasedMagnitude = body:match("[—-]%s*([%d%.]+)%%%s+Increased%s*$")
+	local reducedMagnitude = body:match("[—-]%s*([%d%.]+)%%%s+Reduced%s*$")
+	if increasedMagnitude then
+		group.valueScalar = 1 + tonumber(increasedMagnitude) / 100
+	elseif reducedMagnitude then
+		group.valueScalar = 1 - tonumber(reducedMagnitude) / 100
+	end
+	return group
+end
+
+local function normaliseAdvancedClipboardLine(line)
+	if line:match("^%b()$") then
+		return
+	end
+	local unscalable = line:match("%s+[—-]%s+Unscalable Value$") ~= nil
+	line = line:gsub("%s+[—-]%s+Unscalable Value$", "")
+	local displayLine = line:gsub("([%+%-]?%d+%.?%d*)%((%-?%d+%.?%d*)%-(%-?%d+%.?%d*)%)", function(valueStr)
+		return valueStr
+	end)
+	local range
+	local canResolve = true
+	local inBounds = true
+	local rangeValues = { }
+	local rawLine = line:gsub("([%+%-]?%d+%.?%d*)%((%-?%d+%.?%d*)%-(%-?%d+%.?%d*)%)", function(valueStr, minStr, maxStr)
+		local value = tonumber(valueStr)
+		local min = tonumber(minStr)
+		local max = tonumber(maxStr)
+		if not value or not min or not max then
+			canResolve = false
+			return valueStr .. "(" .. minStr .. "-" .. maxStr .. ")"
+		end
+		local low = math.min(min, max)
+		local high = math.max(min, max)
+		if value < low or value > high then
+			inBounds = false
+			canResolve = false
+		end
+		if high ~= low then
+			local lineRange = (value - low) / (high - low)
+			t_insert(rangeValues, lineRange)
+			if range == nil then
+				range = lineRange
+			elseif math.abs(range - lineRange) > 0.001 then
+				canResolve = false
+			end
+		elseif value ~= low then
+			canResolve = false
+		end
+		local sign = valueStr:match("^[%+%-]") or ""
+		if low < 0 and high < 0 then
+			return "-(" .. tostring(math.abs(low)) .. "-" .. tostring(math.abs(high)) .. ")"
+		end
+		return sign .. "(" .. tostring(low) .. "-" .. tostring(high) .. ")"
+	end)
+	return {
+		line = canResolve and rawLine or displayLine,
+		matchLine = rawLine,
+		range = canResolve and range or nil,
+		canResolve = canResolve,
+		inBounds = inBounds,
+		rangeValues = rangeValues,
+		displayLine = displayLine,
+		unscalable = unscalable or nil,
+	}
+end
+
+local function resolveAdvancedClipboardAffix(item, group)
+	local sourceDef = getAdvancedClipboardSpecialSource(group)
+	local candidatePools = { sourceDef and sourceDef.pool and sourceDef.pool(item) or item.affixes }
+	if not candidatePools[1] then
+		return
+	end
+	local matches = { }
+	for _, pool in ipairs(candidatePools) do
+		for modId, mod in pairs(pool) do
+			if mod.type == group.type and mod.affix == group.affix and #mod == #group.lines then
+				local range
+				local displayLines = { }
+				local rangeValues = { }
+				local matched = true
+				for i, groupLine in ipairs(group.lines) do
+					if not groupLine.inBounds or mod[i] ~= (groupLine.matchLine or groupLine.line) then
+						matched = false
+						break
+					elseif groupLine.range ~= nil then
+						if range == nil then
+							range = groupLine.range
+						elseif math.abs(range - groupLine.range) > 0.001 then
+							matched = false
+							break
+						end
+					end
+					displayLines[i] = groupLine.displayLine or groupLine.line
+					for _, value in ipairs(groupLine.rangeValues or { }) do
+						t_insert(rangeValues, value)
+					end
+				end
+				if matched then
+					if range == nil and rangeValues[1] then
+						local total = 0
+						for _, value in ipairs(rangeValues) do
+							total = total + value
+						end
+						range = m_max(0, m_min(1, total / #rangeValues))
+					end
+					t_insert(matches, {
+						modId = modId,
+						mod = mod,
+						range = range,
+						displayLines = displayLines,
+						sourceId = sourceDef and sourceDef.id or nil,
+					})
+				end
+			end
+		end
+	end
+	if not matches[1] then
+		return
+	elseif #matches == 1 or not group.tier then
+		return matches[1]
+	end
+	table.sort(matches, function(a, b)
+		local modA = a.mod
+		local modB = b.mod
+		if modA.level ~= modB.level then
+			return modA.level > modB.level
+		end
+		return a.modId < b.modId
+	end)
+	return matches[group.tier] or matches[1]
+end
+
+local function buildParsedModLine(line, opts)
+	opts = opts or { }
+	local modLine = {
+		line = line,
+		modTags = opts.modTags or { },
+	}
+	if opts.range ~= nil then
+		modLine.range = opts.range
+	end
+	if opts.valueScalar ~= nil then
+		modLine.valueScalar = opts.valueScalar
+	end
+	for key, value in pairs(opts.flags or { }) do
+		modLine[key] = value or nil
+	end
+	local modList, extra = parseModLineText(line, opts.range, opts.valueScalar)
+	modLine.modList = modList or { }
+	modLine.extra = extra
+	return modLine
+end
+
+local function buildAdvancedClipboardModLine(item, group, groupLine)
+	local catalystScalar = getCatalystScalar(item.catalyst, { }, item.catalystQuality)
+	return buildParsedModLine(groupLine.line, {
+		range = groupLine.range,
+		valueScalar = catalystScalar,
+		flags = {
+			implicit = group and group.type == "Implicit" or nil,
+			crafted = group and group.crafted or nil,
+			fractured = group and group.fractured or nil,
+			exarch = group and group.exarch or nil,
+			eater = group and group.eater or nil,
+			veiled = group and group.veiled or nil,
+			specialSource = group and group.preserveOnCraft or nil,
+			unscalable = groupLine.unscalable or nil,
+		},
+	})
+end
+
+local function buildResolvedCustomAffixModLine(mod, line, range, opts)
+	return buildParsedModLine(line, {
+		range = range,
+		modTags = mod and mod.modTags or { },
+		flags = {
+			custom = true,
+			veiled = opts and opts.veiled or nil,
+			unscalable = opts and opts.unscalable or nil,
+		},
+	})
+end
+
+local modifierMagnitudeScalarDefs = {
+	implicit = {
+		modName = "ImplicitModifierMagnitudes",
+		literalScalars = {
+			["implicit modifier magnitudes are doubled"] = 2,
+			["implicit modifier magnitudes are tripled"] = 3,
+		},
+		increasedPattern = "^([%+%-]?[%d%.]+)%% increased implicit modifier magnitudes$",
+		reducedPattern = "^([%+%-]?[%d%.]+)%% reduced implicit modifier magnitudes$",
+	},
+	unveiled = {
+		modName = "UnveiledModifierMagnitudes",
+		increasedPattern = "^([%+%-]?[%d%.]+)%% increased unveiled modifier magnitudes$",
+	},
+}
+
+local function getMagnitudeScalarFromModList(modList, modName)
+	if not modList then
+		return
+	end
+	local totalIncrease = 0
+	for _, mod in ipairs(modList) do
+		if mod.name == modName and mod.type == "INC" then
+			totalIncrease = totalIncrease + mod.value
+		end
+	end
+	if totalIncrease ~= 0 then
+		return 1 + totalIncrease / 100
+	end
+end
+
+local function getModifierMagnitudeScalar(modLine, scalarDef)
+	local line = modLine.line
+	if modLine.range and line:match("%(%-?[%d%.]+%-%-?[%d%.]+%)") then
+		local scalar = getMagnitudeScalarFromModList(parseModLineText(line, modLine.range), scalarDef.modName)
+		if scalar then
+			return scalar
+		end
+	end
+	local scalar = getMagnitudeScalarFromModList(modLine.modList, scalarDef.modName)
+	if scalar then
+		return scalar
+	end
+	local lowerLine = line:lower()
+	if scalarDef.literalScalars and scalarDef.literalScalars[lowerLine] then
+		return scalarDef.literalScalars[lowerLine]
+	end
+	local increased = scalarDef.increasedPattern and lowerLine:match(scalarDef.increasedPattern)
+	if increased then
+		return 1 + tonumber(increased) / 100
+	end
+	local reduced = scalarDef.reducedPattern and lowerLine:match(scalarDef.reducedPattern)
+	if reduced then
+		return 1 - tonumber(reduced) / 100
+	end
+end
+
+local function getImplicitModifierMagnitudeScalar(modLine)
+	return getModifierMagnitudeScalar(modLine, modifierMagnitudeScalarDefs.implicit)
+end
+
+local function getUnveiledModifierMagnitudeScalar(modLine)
+	return getModifierMagnitudeScalar(modLine, modifierMagnitudeScalarDefs.unveiled)
+end
+
+local function appendAdvancedClipboardGroupModLines(item, targetList, group)
+	for _, groupLine in ipairs(group.lines) do
+		t_insert(targetList, buildAdvancedClipboardModLine(item, group, groupLine))
+	end
+end
+
+local function appendAdvancedClipboardSpecialSourceModLines(item, resolved, group)
+	local mod = resolved.mod or item:GetAffix(resolved.modId)
+	for lineIndex, line in ipairs(mod or { }) do
+		local groupLine = group and group.lines and group.lines[lineIndex] or nil
+		t_insert(item.explicitModLines, buildResolvedCustomAffixModLine(mod, line, resolved.range, {
+			veiled = resolved.sourceId == "VEILED",
+			unscalable = groupLine and groupLine.unscalable or nil,
+		}))
+	end
+end
+
+local function applyAdvancedClipboardAffixGroup(item, group)
+	local resolved = resolveAdvancedClipboardAffix(item, group)
+	if not resolved then
+		group.preserveOnCraft = true
+		appendAdvancedClipboardGroupModLines(item, item.explicitModLines, group)
+		return false
+	end
+	if resolved.sourceId then
+		appendAdvancedClipboardSpecialSourceModLines(item, resolved, group)
+		return false
+	end
+	item.crafted = true
+	resolved.fractured = group.fractured
+	resolved.displayLines = resolved.displayLines and copyTable(resolved.displayLines) or nil
+	t_insert(group.type == "Prefix" and item.prefixes or item.suffixes, resolved)
+	return true
+end
+
+local function getModifierMagnitudeScalars(modLineLists, checkVariant)
+	local totalIncreases = {
+		implicit = 0,
+		unveiled = 0,
+	}
+	for _, modLineList in ipairs(modLineLists) do
+		for _, modLine in ipairs(modLineList or { }) do
+			if checkVariant(modLine) then
+				local implicitScalar = getImplicitModifierMagnitudeScalar(modLine)
+				if implicitScalar then
+					totalIncreases.implicit = totalIncreases.implicit + (implicitScalar - 1) * 100
+				end
+				local unveiledScalar = getUnveiledModifierMagnitudeScalar(modLine)
+				if unveiledScalar then
+					totalIncreases.unveiled = totalIncreases.unveiled + (unveiledScalar - 1) * 100
+				end
+			end
+		end
+	end
+	return {
+		implicit = 1 + totalIncreases.implicit / 100,
+		unveiled = 1 + totalIncreases.unveiled / 100,
+	}
+end
+
+local function parseCraftedAffixSpec(specVal)
+	local affix = { }
+	specVal = specVal:gsub("{(.-)}", function(spec)
+		local key, value = spec:match("^([^:]+):(.+)$")
+		if key == "range" then
+			affix.range = tonumber(value)
+		elseif spec == "fractured" then
+			affix.fractured = true
+		end
+		return ""
+	end)
+	affix.modId = specVal
+	affix.range = affix.range or (specVal ~= "None" and main.defaultItemAffixQuality) or nil
+	return affix
+end
+
+local function buildCraftedAffixSpec(affix)
+	local spec = ""
+	if affix.fractured then
+		spec = spec .. "{fractured}"
+	end
+	if affix.range then
+		spec = spec .. "{range:" .. round(affix.range, 3) .. "}"
+	end
+	return spec .. affix.modId
+end
+
+local function isAdvancedClipboardMetaLine(line)
+	return influenceItemMap[line]
+		or line == "Split"
+		or line == "Mirrored"
+		or line == "Corrupted"
+		or line == "Fractured Item"
+		or line == "Synthesised Item"
+		or line == "Unidentified"
+end
+
+local function isBaseDisplayLine(item, line)
+	if not item or not item.base or not line then
+		return false
+	end
+	return line == item.base.type
+		or line == item.base.subType
+		or (item.base.subType and line == item.base.subType .. " " .. item.base.type)
+end
+
+local ignoredGameFooterLines = {
+	["Right click to drink. Can only hold charges while in belt. Refills as you kill monsters."] = true,
+	["Right click to activate. Only one Tincture in your belt can be active at a time. Mana Burn causes you to lose 1% of your maximum Mana per stack per second. Can be deactivated manually, or will automatically deactivate when you reach 0 Mana."] = true,
+	["Place into an allocated Jewel Socket on the Passive Skill Tree. Right click to remove from the Socket."] = true,
+}
+
+local knownFlavourLineLookupCache = { }
+local function getKnownFlavourLineLookup(title, item)
+	if not title and not (item and item.title) then
+		return
+	end
+	title = (title or item.title):gsub("^Foulborn%s+", "")
+	local cacheKey = title
+	if item and item.baseName then
+		cacheKey = cacheKey .. "\31" .. item.baseName
+	end
+	if knownFlavourLineLookupCache[cacheKey] == nil then
+		local lookup = { }
+		for _, entry in pairs(data.flavourText or { }) do
+			if entry.name == title and entry.text then
+				for _, line in ipairs(entry.text) do
+					lookup[line] = true
+				end
+			end
+		end
+		if item and item.rarity == "UNIQUE" and item.baseName then
+			local unique = main and main.uniqueDB and main.uniqueDB.list and main.uniqueDB.list[title .. ", " .. item.baseName:gsub(" %(.+%)","")]
+			if unique and unique.flavourText then
+				for _, line in ipairs(unique.flavourText) do
+					lookup[line] = true
+				end
+			end
+		end
+		knownFlavourLineLookupCache[cacheKey] = next(lookup) and lookup or false
+	end
+	return knownFlavourLineLookupCache[cacheKey] or nil
+end
+
+local function removeKnownFlavourTextFromExplicitMods(item)
+	if item.rarity ~= "UNIQUE" and item.rarity ~= "RELIC" then
+		return false
+	end
+	local flavourLookup = getKnownFlavourLineLookup(item.title, item)
+	if not flavourLookup then
+		return false
+	end
+	local filtered = { }
+	local removed = false
+	for _, modLine in ipairs(item.explicitModLines) do
+		if not (modLine.extra and flavourLookup[modLine.line]) then
+			t_insert(filtered, modLine)
+		else
+			removed = true
+		end
+	end
+	item.explicitModLines = filtered
+	return removed
+end
+
+local function escapeLuaPattern(text)
+	return text:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1")
+end
+
+local function matchImportedEnchantLineToTemplate(line, templateLine)
+	if line == templateLine then
+		return true, nil
+	end
+	local ranges = { }
+	local placeholderLine = templateLine:gsub("(%+?)%((%-?%d+%.?%d*)%-(%-?%d+%.?%d*)%)", function(plus, minStr, maxStr)
+		t_insert(ranges, {
+			sign = plus,
+			min = tonumber(minStr),
+			max = tonumber(maxStr),
+		})
+		return "__RANGE" .. #ranges .. "__"
+	end)
+	if not ranges[1] then
+		return
+	end
+	local pattern = "^" .. escapeLuaPattern(placeholderLine) .. "$"
+	for i = 1, #ranges do
+		pattern = pattern:gsub("__RANGE" .. i .. "__", function()
+			return "([%+%-]?[%d%.]+)"
+		end, 1)
+	end
+	local captures = { line:match(pattern) }
+	if #captures ~= #ranges then
+		return
+	end
+	local resolvedRange
+	for i, valueStr in ipairs(captures) do
+		local value = tonumber(valueStr)
+		local min = ranges[i].min
+		local max = ranges[i].max
+		if not value or not min or not max then
+			return
+		end
+		local low = m_min(min, max)
+		local high = m_max(min, max)
+		if value < low or value > high then
+			return
+		end
+		local lineRange
+		if high ~= low then
+			lineRange = (value - low) / (high - low)
+		elseif value == low then
+			lineRange = 0
+		else
+			return
+		end
+		if resolvedRange == nil then
+			resolvedRange = lineRange
+		elseif math.abs(resolvedRange - lineRange) > 0.001 then
+			return
+		end
+	end
+	return true, resolvedRange
+end
+
+local function canonicalizeEnchantModLines(item)
+	if not item.enchantments or not item.enchantModLines[1] then
+		return
+	end
+	local matchedAny = false
+	local i = 1
+	while i <= #item.enchantModLines do
+		local bestMatch
+		for _, sourceEnchants in pairs(item.enchantments) do
+			for _, enchantLine in ipairs(sourceEnchants) do
+				local templateParts = { }
+				for part in enchantLine:gmatch("([^/]+)") do
+					t_insert(templateParts, part)
+				end
+				if i + #templateParts - 1 <= #item.enchantModLines then
+					local ranges = { }
+					local matched = true
+					for partIndex, templatePart in ipairs(templateParts) do
+						local modLine = item.enchantModLines[i + partIndex - 1]
+						local lineMatched, range = matchImportedEnchantLineToTemplate(modLine.line, templatePart)
+						if not lineMatched then
+							matched = false
+							break
+						end
+						ranges[partIndex] = range
+					end
+					if matched and (not bestMatch or #templateParts > #bestMatch.parts) then
+						bestMatch = {
+							parts = templateParts,
+							ranges = ranges,
+						}
+					end
+				end
+			end
+		end
+			if bestMatch then
+				for partIndex, templatePart in ipairs(bestMatch.parts) do
+					local modLine = item.enchantModLines[i + partIndex - 1]
+					modLine.line = templatePart
+					modLine.range = bestMatch.ranges[partIndex] ~= nil and bestMatch.ranges[partIndex] or modLine.range
+				end
+				matchedAny = true
+				i = i + #bestMatch.parts
+		else
+			i = i + 1
+		end
+	end
+	return matchedAny
+end
+
+local function isLikelyAdvancedUniqueFlavourTailLine(modLine)
+	if not modLine or not modLine.extra then
+		return false
+	end
+	local line = modLine.line or ""
+	if line:find("%d") or line:find("%%") or line:match("^%b()$") then
+		return false
+	end
+	if line:find("^\"") or line:find("\"$") then
+		return true
+	end
+	if line:find("[%.!,;:]$") then
+		return true
+	end
+	if line:find("'") and line:match("^[%a%s%p]+$") then
+		return true
+	end
+	return false
+end
+
+local function buildAdvancedUniqueComparableKey(modLine)
+	local key = modLine.line:gsub("\n", "\n")
+	key = key:gsub("%(%-?[%d%.]+%-%-?[%d%.]+%)", "#")
+	key = key:gsub("[%+%-]?%d+%.?%d*", "#")
+	key = key:gsub("^[%+%-](.+)$", "%1")
+	if modLine.enchant then
+		key = key .. "\31enchant"
+	end
+	if modLine.implicit then
+		key = key .. "\31implicit"
+	end
+	return key
+end
+
+local function collectAdvancedUniqueComparableEntries(item)
+	local entries = { }
+	for _, listInfo in ipairs({
+		{ section = "enchantModLines", modList = item.enchantModLines },
+		{ section = "implicitModLines", modList = item.implicitModLines },
+		{ section = "explicitModLines", modList = item.explicitModLines },
+	}) do
+		local modList = listInfo.modList
+		for _, modLine in ipairs(modList) do
+			if item:CheckModLineVariant(modLine) then
+				t_insert(entries, {
+					key = buildAdvancedUniqueComparableKey(modLine),
+					range = modLine.range,
+					section = listInfo.section,
+					modLine = copyTable(modLine),
+				})
+			end
+		end
+	end
+	return entries
+end
+
+local function multisetScoreAdvancedUniqueEntries(importedEntries, candidateEntries)
+	local remaining = { }
+	for _, entry in ipairs(importedEntries) do
+		remaining[entry.key] = (remaining[entry.key] or 0) + 1
+	end
+	local matches = 0
+	for _, entry in ipairs(candidateEntries) do
+		if (remaining[entry.key] or 0) > 0 then
+			remaining[entry.key] = remaining[entry.key] - 1
+			matches = matches + 1
+		end
+	end
+	return matches
+end
+
+local function isBetterAdvancedUniqueSelection(candidate, bestSelection, selectionFields, template)
+	if not bestSelection then
+		return true
+	end
+	for _, field in ipairs(selectionFields) do
+		local templateValue = template[field] or 0
+		local candidateDelta = math.abs((candidate[field] or 0) - templateValue)
+		local bestDelta = math.abs((bestSelection[field] or 0) - templateValue)
+		if candidateDelta ~= bestDelta then
+			return candidateDelta < bestDelta
+		end
+	end
+	return false
+end
+
+local function maybeCanonicalizeAdvancedUnique(item, hadAdvancedClipboardGroups)
+	if not hadAdvancedClipboardGroups or item.variantList or (item.rarity ~= "UNIQUE" and item.rarity ~= "RELIC") then
+		return
+	end
+	if not main or not main.uniqueDB or main.uniqueDB.loading then
+		return
+	end
+	local template = main.uniqueDB.list[item.name]
+	if not template or not template.variantList then
+		return
+	end
+	local importedEntries = collectAdvancedUniqueComparableEntries(item)
+	if not importedEntries[1] then
+		return
+	end
+
+	local selectionFields = { "variant" }
+	if template.hasAltVariant then
+		t_insert(selectionFields, "variantAlt")
+	end
+	if template.hasAltVariant2 then
+		t_insert(selectionFields, "variantAlt2")
+	end
+	if template.hasAltVariant3 then
+		t_insert(selectionFields, "variantAlt3")
+	end
+	if template.hasAltVariant4 then
+		t_insert(selectionFields, "variantAlt4")
+	end
+	if template.hasAltVariant5 then
+		t_insert(selectionFields, "variantAlt5")
+	end
+	if #selectionFields > 2 then
+		return
+	end
+
+	local bestSelection
+	local bestScore = -1
+	local candidate = new("Item", template:BuildRaw())
+	local function searchSelection(index)
+		if index > #selectionFields then
+			local score = multisetScoreAdvancedUniqueEntries(importedEntries, collectAdvancedUniqueComparableEntries(candidate))
+			if score > bestScore or (score == bestScore and isBetterAdvancedUniqueSelection(candidate, bestSelection, selectionFields, template)) then
+				bestScore = score
+				bestSelection = { }
+				for _, field in ipairs(selectionFields) do
+					bestSelection[field] = candidate[field]
+				end
+			end
+			return
+		end
+		local field = selectionFields[index]
+		for variantId = 1, #candidate.variantList do
+			candidate[field] = variantId
+			searchSelection(index + 1)
+		end
+	end
+	searchSelection(1)
+	if not bestSelection or bestScore <= 0 then
+		return
+	end
+
+	local resolved = new("Item", template:BuildRaw())
+	for field, value in pairs(bestSelection) do
+		resolved[field] = value
+	end
+
+	local importedByKey = { }
+	for _, entry in ipairs(importedEntries) do
+		importedByKey[entry.key] = importedByKey[entry.key] or { }
+		t_insert(importedByKey[entry.key], entry)
+	end
+	for _, sectionName in ipairs({ "enchantModLines", "implicitModLines", "explicitModLines" }) do
+		local filtered = { }
+		for _, modLine in ipairs(resolved[sectionName]) do
+			if resolved:CheckModLineVariant(modLine) then
+				local list = importedByKey[buildAdvancedUniqueComparableKey(modLine)]
+				if list and list[1] then
+					modLine.range = list[1].range
+					modLine.veiled = list[1].modLine and list[1].modLine.veiled or nil
+					modLine.unscalable = list[1].modLine and list[1].modLine.unscalable or nil
+					t_remove(list, 1)
+					t_insert(filtered, modLine)
+				end
+			else
+				t_insert(filtered, modLine)
+			end
+		end
+		resolved[sectionName] = filtered
+	end
+	local resolvedFlavourLookup = getKnownFlavourLineLookup(resolved.title, resolved)
+	for _, list in pairs(importedByKey) do
+		for _, entry in ipairs(list) do
+			if entry.modLine and resolved[entry.section]
+				and not (entry.modLine.extra and resolvedFlavourLookup and resolvedFlavourLookup[entry.modLine.line])
+				and not (entry.section == "explicitModLines" and isLikelyAdvancedUniqueFlavourTailLine(entry.modLine)) then
+				t_insert(resolved[entry.section], copyTable(entry.modLine))
+			end
+		end
+	end
+
+	resolved.quality = item.quality
+	resolved.catalyst = item.catalyst
+	resolved.catalystQuality = item.catalystQuality
+	resolved.itemLevel = item.itemLevel
+	resolved.sockets = item.sockets
+	resolved.flaskDisplayData = item.flaskDisplayData and copyTable(item.flaskDisplayData) or nil
+	resolved.note = item.note
+	resolved.split = item.split
+	resolved.mirrored = item.mirrored
+	resolved.corrupted = item.corrupted
+	resolved.fractured = item.fractured
+	resolved.synthesised = item.synthesised
+	resolved.cleansing = item.cleansing
+	resolved.tangle = item.tangle
+	resolved.adjudicator = item.adjudicator
+	resolved.basilisk = item.basilisk
+	resolved.crusader = item.crusader
+	resolved.eyrie = item.eyrie
+	resolved.shaper = item.shaper
+	resolved.elder = item.elder
+	resolved:BuildAndParseRaw()
+	return resolved
+end
+
 -- Parse raw item data and extract item name, base type, quality, and modifiers
 function ItemClass:ParseRaw(raw, rarity, highQuality)
 	self.raw = raw
@@ -296,6 +1159,7 @@ function ItemClass:ParseRaw(raw, rarity, highQuality)
 	self.base = nil
 	self.rarity = rarity or "UNIQUE"
 	self.quality = nil
+	self.flaskDisplayData = nil
 	self.rawLines = { }
 	-- Find non-blank lines and trim whitespace
 	for line in raw:gmatch("%s*([^\n]*%S)") do
@@ -367,18 +1231,58 @@ function ItemClass:ParseRaw(raw, rarity, highQuality)
 	local flaskBuffLines
 	local tinctureBuffLines
 	local deferJewelRadiusIndexAssignment
+	local advancedClipboardGroups = { }
+	local activeAdvancedClipboardGroup
+	local strippedIgnoredMetadata
+	local skipNextBuffReminderLine
 	local gameModeStage = "FINDIMPLICIT"
 	local foundExplicit, foundImplicit
 
 	while self.rawLines[l] do	
 		local line = self.rawLines[l]
+		local advancedClipboardGroup
+		if skipNextBuffReminderLine then
+			skipNextBuffReminderLine = nil
+			if line:match("^%b()$") then
+				strippedIgnoredMetadata = true
+				goto continue
+			end
+		end
+		if ignoredGameFooterLines[line] then
+			strippedIgnoredMetadata = true
+			goto continue
+		end
+		advancedClipboardGroup = parseAdvancedClipboardDescriptor(line)
+		if advancedClipboardGroup then
+			activeAdvancedClipboardGroup = advancedClipboardGroup
+			t_insert(advancedClipboardGroups, advancedClipboardGroup)
+			goto continue
+		end
+		if activeAdvancedClipboardGroup and line ~= "--------" then
+			if isAdvancedClipboardMetaLine(line) then
+				activeAdvancedClipboardGroup = nil
+			else
+			if line:match("^%b()$") then
+				goto continue
+			end
+			local advancedLine = normaliseAdvancedClipboardLine(line)
+			if advancedLine then
+				t_insert(activeAdvancedClipboardGroup.lines, advancedLine)
+				goto continue
+			end
+			end
+		elseif line == "--------" then
+			activeAdvancedClipboardGroup = nil
+		end
 		if line == "Veiled Prefix" or line == "Veiled Suffix" then
 			self.veiled = true
 		end
 		if flaskBuffLines and flaskBuffLines[line] then
 			flaskBuffLines[line] = nil
+			skipNextBuffReminderLine = true
 		elseif tinctureBuffLines and tinctureBuffLines[line] then
 			tinctureBuffLines[line] = nil
+			skipNextBuffReminderLine = true
 		elseif line == "--------" then
 			self.checkSection = true
 		elseif line == "Split" then
@@ -430,6 +1334,9 @@ function ItemClass:ParseRaw(raw, rarity, highQuality)
 					self.uniqueID = specVal
 				elseif specName == "Item Level" then
 					self.itemLevel = specToNumber(specVal)
+				elseif specName == "Memory Strands" then
+					-- Metadata from Memories; not an item stat and should not survive import.
+					strippedIgnoredMetadata = true
 				elseif specName == "Requires Class" then
 					self.classRestriction = specVal
 				elseif specName == "Quality" then
@@ -536,19 +1443,9 @@ function ItemClass:ParseRaw(raw, rarity, highQuality)
 				elseif specName == "Implicit" then
 					self.implicit = true
 				elseif specName == "Prefix" then
-					local range, affix = specVal:match("{range:([%d.]+)}(.+)")
-					range = range or ((affix or specVal) ~= "None" and main.defaultItemAffixQuality)
-					t_insert(self.prefixes, {
-						modId = affix or specVal,
-						range = tonumber(range),
-					})
+					t_insert(self.prefixes, parseCraftedAffixSpec(specVal))
 				elseif specName == "Suffix" then
-					local range, affix = specVal:match("{range:([%d.]+)}(.+)")
-					range = range or ((affix or specVal) ~= "None" and main.defaultItemAffixQuality)
-					t_insert(self.suffixes, {
-						modId = affix or specVal,
-						range = tonumber(range),
-					})
+					t_insert(self.suffixes, parseCraftedAffixSpec(specVal))
 				elseif specName == "Implicits" then
 					implicitLines = specToNumber(specVal) or 0
 					gameModeStage = "EXPLICIT"
@@ -728,6 +1625,38 @@ function ItemClass:ParseRaw(raw, rarity, highQuality)
 					-- Base lines don't need mod parsing, skip it
 					goto continue
 				end
+				if self.base and self.base.flask then
+					local duration = line:match("^Lasts ([%d%.]+) Seconds$")
+					if duration then
+						self.flaskDisplayData = self.flaskDisplayData or { }
+						self.flaskDisplayData.duration = tonumber(duration)
+						goto continue
+					end
+					local chargesUsed, chargesMax = line:match("^Consumes (%d+) of (%d+) Charges on use$")
+					if chargesUsed then
+						self.flaskDisplayData = self.flaskDisplayData or { }
+						self.flaskDisplayData.chargesUsed = tonumber(chargesUsed)
+						self.flaskDisplayData.chargesMax = tonumber(chargesMax)
+						goto continue
+					end
+					local currentCharges = line:match("^Currently has (%d+) Charges$")
+					if currentCharges then
+						self.flaskDisplayData = self.flaskDisplayData or { }
+						self.flaskDisplayData.currentCharges = tonumber(currentCharges)
+						goto continue
+					end
+				elseif self.base and self.base.tincture then
+					local manaBurn = line:match("^Inflicts Mana Burn every ([%d%.]+) Seconds$")
+					if manaBurn then
+						strippedIgnoredMetadata = true
+						goto continue
+					end
+					local cooldown = line:match("^[%d%.]+ Second Cooldown [Ww]hen Deactivated$")
+					if cooldown then
+						strippedIgnoredMetadata = true
+						goto continue
+					end
+				end
 				if modLine.implicit then
 					foundImplicit = true
 					gameModeStage = "IMPLICIT"
@@ -820,6 +1749,9 @@ function ItemClass:ParseRaw(raw, rarity, highQuality)
 					modLines = self.explicitModLines
 				end
 				modLine.line = line
+				if modLines == self.implicitModLines then
+					modLine.implicit = true
+				end
 				if modList then
 					modLine.modList = modList
 					modLine.extra = extra
@@ -839,7 +1771,7 @@ function ItemClass:ParseRaw(raw, rarity, highQuality)
 						foundExplicit = true
 					end
 				elseif mode == "GAME" then
-					if gameModeStage == "IMPLICIT" or gameModeStage == "EXPLICIT" or (gameModeStage == "FINDIMPLICIT" and (not data.itemBases[line]) and not (self.name == line) and not line:find("Two%-Toned") and not (self.base and (line == self.base.type or self.base.subType and line == self.base.subType .. " " .. self.base.type))) then
+					if gameModeStage == "IMPLICIT" or gameModeStage == "EXPLICIT" or (gameModeStage == "FINDIMPLICIT" and (not data.itemBases[line]) and not (self.name == line) and not line:find("Two%-Toned") and not isBaseDisplayLine(self, line)) then
 						modLine.modList = { }
 						modLine.extra = line
 						t_insert(modLines, modLine)
@@ -865,6 +1797,23 @@ function ItemClass:ParseRaw(raw, rarity, highQuality)
 			self.requirements.level = importedLevelReq
 		else
 			self.requirements.level = self.base.req.level
+		end
+	end
+	local strippedKnownFlavour = removeKnownFlavourTextFromExplicitMods(self)
+	local normalisedEnchantLines = canonicalizeEnchantModLines(self)
+	local advancedAffixGroupCount = 0
+	local advancedAffixResolvedCount = 0
+	local hadAdvancedClipboardGroups = advancedClipboardGroups[1] ~= nil
+	for _, group in ipairs(advancedClipboardGroups) do
+		if group.type == "Implicit" then
+			appendAdvancedClipboardGroupModLines(self, self.implicitModLines, group)
+		elseif group.type == "Prefix" or group.type == "Suffix" then
+			advancedAffixGroupCount = advancedAffixGroupCount + 1
+			if applyAdvancedClipboardAffixGroup(self, group) then
+				advancedAffixResolvedCount = advancedAffixResolvedCount + 1
+			end
+		else
+			appendAdvancedClipboardGroupModLines(self, self.explicitModLines, group)
 		end
 	end
 	self.affixLimit = 0
@@ -894,20 +1843,28 @@ function ItemClass:ParseRaw(raw, rarity, highQuality)
 				for i = 1, (list.limit or (self.affixLimit / 2)) do
 					if not list[i] then
 						list[i] = { modId = "None" }
-					elseif list[i].modId ~= "None" and not self.affixes[list[i].modId] then
-						for modId, mod in pairs(self.affixes) do
-							if list[i].modId == mod.affix then
-								list[i].modId = modId
-								break
+						elseif list[i].modId ~= "None" and not self.affixes[list[i].modId] then
+						if not self:GetAffix(list[i].modId) then
+							for modId, mod in pairs(self.affixes) do
+								if list[i].modId == mod.affix then
+									list[i].modId = modId
+									break
+								end
 							end
-						end
-						if not self.affixes[list[i].modId] then
-							list[i].modId = "None"
+							if not self:GetAffix(list[i].modId) then
+								list[i].modId = "None"
+							end
 						end
 					end
 				end
 			end
 		end
+	end
+	if advancedAffixResolvedCount > 0 and self.crafted then
+		self:RebuildExplicitModLinesFromAffixes(copyTable(self.explicitModLines))
+	end
+	if hadAdvancedClipboardGroups or strippedIgnoredMetadata or strippedKnownFlavour or normalisedEnchantLines then
+		self.raw = self:BuildRaw()
 	end
 	if self.base and self.base.socketLimit then
 		if #self.sockets == 0 then
@@ -947,6 +1904,13 @@ function ItemClass:ParseRaw(raw, rarity, highQuality)
 		end
 	end
 	self:BuildModList()
+	local canonicalUnique = maybeCanonicalizeAdvancedUnique(self, hadAdvancedClipboardGroups)
+	if canonicalUnique then
+		wipeTable(self)
+		for key, value in pairs(canonicalUnique) do
+			self[key] = value
+		end
+	end
 	if deferJewelRadiusIndexAssignment then
 		self.jewelRadiusIndex = self.jewelData.radiusIndex
 	end
@@ -1036,7 +2000,34 @@ function ItemClass:GetNecropolisModSpawnWeight(mod)
 end
 
 function ItemClass:CheckIfModIsDelve(mod)
-	return mod.affix == "Subterranean" or mod.affix == "of the Underground"
+	local sourceDef = getAdvancedClipboardSpecialSource("Subterranean")
+	return sourceDef and sourceDef.matchesAffix(mod.affix) or false
+end
+
+function ItemClass:CheckIfModIsEssence(mod)
+	local sourceDef = getAdvancedClipboardSpecialSource("Essences")
+	return sourceDef and sourceDef.matchesAffix(mod.affix) or false
+end
+
+function ItemClass:CheckIfModIsVeiled(mod)
+	local sourceDef = getAdvancedClipboardSpecialSourceById("VEILED")
+	return sourceDef and sourceDef.matchesMod(mod) or false
+end
+
+function ItemClass:CheckIfModIsBeastCraft(mod)
+	local sourceDef = getAdvancedClipboardSpecialSource("of Farrul")
+	return sourceDef and sourceDef.matchesAffix(mod.affix) or false
+end
+
+function ItemClass:CheckIfModUsesSpecialSource(mod)
+	return self:CheckIfModIsDelve(mod)
+		or self:CheckIfModIsEssence(mod)
+		or self:CheckIfModIsVeiled(mod)
+		or self:CheckIfModIsBeastCraft(mod)
+end
+
+function ItemClass:GetAffix(modId)
+	return getFallbackAffix(self, modId)
 end
 
 
@@ -1076,10 +2067,10 @@ function ItemClass:BuildRaw()
 	if self.crafted then
 		t_insert(rawLines, "Crafted: true")
 		for i, affix in ipairs(self.prefixes or { }) do
-			t_insert(rawLines, "Prefix: " .. (affix.range and ("{range:" .. round(affix.range,3) .. "}") or "") .. affix.modId)
+			t_insert(rawLines, "Prefix: " .. buildCraftedAffixSpec(affix))
 		end
 		for i, affix in ipairs(self.suffixes or { }) do
-			t_insert(rawLines, "Suffix: " .. (affix.range and ("{range:" .. round(affix.range,3) .. "}") or "") .. affix.modId)
+			t_insert(rawLines, "Suffix: " .. buildCraftedAffixSpec(affix))
 		end
 	end
 	if self.catalyst and self.catalyst > 0 then
@@ -1131,10 +2122,19 @@ function ItemClass:BuildRaw()
 		if modLine.eater then
 			line = "{eater}" .. line
 		end
-		if modLine.synthesis then
-			line = "{synthesis}" .. line
+		if modLine.veiled then
+			line = "{veiled}" .. line
 		end
-		if modLine.variantList then
+		if modLine.unscalable then
+			line = "{unscalable}" .. line
+		end
+			if modLine.synthesis then
+				line = "{synthesis}" .. line
+			end
+			if modLine.specialSource then
+				line = "{specialSource}" .. line
+			end
+			if modLine.variantList then
 			local varSpec
 			for varId in pairs(modLine.variantList) do
 				varSpec = (varSpec and varSpec .. "," or "") .. varId
@@ -1181,6 +2181,19 @@ function ItemClass:BuildRaw()
 	end
 	if self.quality then
 		t_insert(rawLines, "Quality: " .. self.quality)
+	end
+	if self.base and self.base.flask and (self.flaskData or self.flaskDisplayData) then
+		local displayData = self.flaskData or self.flaskDisplayData
+		local currentCharges = self.flaskDisplayData and self.flaskDisplayData.currentCharges or displayData.currentCharges
+		if displayData.duration then
+			t_insert(rawLines, string.format("Lasts %.2f Seconds", displayData.duration))
+		end
+		if displayData.chargesUsed and displayData.chargesMax then
+			t_insert(rawLines, string.format("Consumes %d of %d Charges on use", displayData.chargesUsed, displayData.chargesMax))
+		end
+		if currentCharges then
+			t_insert(rawLines, string.format("Currently has %d Charges", currentCharges))
+		end
 	end
 	if self.sockets and #self.sockets > 0 then
 		local line = "Sockets: "
@@ -1242,32 +2255,45 @@ function ItemClass:BuildRaw()
 end
 
 function ItemClass:BuildAndParseRaw()
+	if self.base and self.base.flask then
+		self:BuildModList()
+	end
 	local raw = self:BuildRaw()
 	self:ParseRaw(raw)
 end
 
--- Rebuild explicit modifiers using the item's affixes
-function ItemClass:Craft()
-	-- Save off any crafted or custom mods so they can be re-added at the end
-	local savedMods = {}
-	for _, mod in ipairs(self.explicitModLines) do
-		if mod.crafted or mod.custom then
-			t_insert(savedMods, mod)
-		end
-	end
-
+function ItemClass:RebuildExplicitModLinesFromAffixes(savedMods)
+	savedMods = savedMods or { }
 	wipeTable(self.explicitModLines)
 	self.namePrefix = ""
 	self.nameSuffix = ""
 	self.requirements.level = self.base.req.level
 	local statOrder = { }
+	local savedQualityMods = { }
+	local savedOtherMods = { }
+	local function rebuildParsedLine(modLine)
+		local modList, extra = modLib.parseMod(modLine.line)
+		modLine.modList = modList or { }
+		modLine.extra = extra
+	end
+	for _, mod in ipairs(savedMods) do
+		if mod.line and mod.line:match("^Quality %([^)]+ Modifiers%): ") then
+			t_insert(savedQualityMods, mod)
+		else
+			t_insert(savedOtherMods, mod)
+		end
+	end
+	for _, mod in ipairs(savedQualityMods) do
+		t_insert(self.explicitModLines, mod)
+	end
 	for _, list in ipairs({self.prefixes,self.suffixes}) do
 		for i = 1, (list.limit or (self.affixLimit / 2)) do
 			local affix = list[i]
 			if not affix then
 				list[i] = { modId = "None" }
+				affix = list[i]
 			end
-			local mod = self.affixes[affix.modId]
+			local mod = self:GetAffix(affix.modId)
 			if mod then
 				if mod.type == "Prefix" then
 					self.namePrefix = mod.affix .. " " .. self.namePrefix
@@ -1276,37 +2302,58 @@ function ItemClass:Craft()
 				end
 				self.requirements.level = m_max(self.requirements.level or 0, m_floor(mod.level * 0.8))
 				local rangeScalar = getCatalystScalar(self.catalyst, mod.modTags, self.catalystQuality)
-				for i, line in ipairs(mod) do
-					line = itemLib.applyRange(line, affix.range or 0.5, rangeScalar)
-					local order = mod.statOrder[i]
+				for j, line in ipairs(mod) do
+					local exactLine = affix.displayLines and affix.displayLines[j]
+					line = exactLine or itemLib.applyRange(line, affix.range or 0.5, rangeScalar)
+					local order = mod.statOrder[j]
 					if statOrder[order] then
-						-- Combine stats
 						local start = 1
 						statOrder[order].line = statOrder[order].line:gsub("%d+", function(num)
-							local s, e, other = line:find("(%d+)", start)
+							local _, e, other = line:find("(%d+)", start)
 							start = e + 1
 							return tonumber(num) + tonumber(other)
 						end)
+						rebuildParsedLine(statOrder[order])
 					else
-						local modLine = { line = line, order = order }
+						local modLine = { line = line, order = order, modTags = mod.modTags }
+						if affix.fractured then
+							modLine.fractured = true
+						end
+						rebuildParsedLine(modLine)
 						for l = 1, #self.explicitModLines + 1 do
-							if not self.explicitModLines[l] or self.explicitModLines[l].order > order then
+							if not self.explicitModLines[l] or (self.explicitModLines[l].order and self.explicitModLines[l].order > order) then
 								t_insert(self.explicitModLines, l, modLine)
 								break
 							end
 						end
 						statOrder[order] = modLine
-					end	
+					end
 				end
 			end
 		end
 	end
-
-	-- Restore the crafted and custom mods
-	for _, mod in ipairs(savedMods) do
+	for _, mod in ipairs(savedOtherMods) do
 		t_insert(self.explicitModLines, mod)
 	end
+	if self.baseName and self.title then
+		self.name = self.title .. ", " .. self.baseName:gsub(" %(.+%)","")
+	elseif self.baseName then
+		self.name = (self.namePrefix or "") .. self.baseName .. (self.nameSuffix or "")
+	end
+end
 
+-- Rebuild explicit modifiers using the item's affixes
+function ItemClass:Craft()
+	-- Save off explicit lines that aren't represented by the current affix slots
+	-- so source-specific imported lines survive affix edits.
+	local savedMods = {}
+	for _, mod in ipairs(self.explicitModLines) do
+		if mod.crafted or mod.custom or mod.specialSource then
+			t_insert(savedMods, mod)
+		end
+	end
+
+	self:RebuildExplicitModLinesFromAffixes(savedMods)
 	self:BuildAndParseRaw()
 end
 
@@ -1598,6 +2645,29 @@ function ItemClass:BuildModListForSlotNum(baseList, slotNum)
 		for _, value in ipairs(modList:List(nil, "FlaskData")) do
 			flaskData[value.key] = value.value
 		end
+		if self.flaskDisplayData then
+			if self.flaskDisplayData.duration and flaskData.duration and not self.flaskDisplayData.durationScale and flaskData.duration ~= 0 then
+				self.flaskDisplayData.durationScale = self.flaskDisplayData.duration / flaskData.duration
+			end
+			if self.flaskDisplayData.chargesMax and flaskData.chargesMax and self.flaskDisplayData.chargesMaxDelta == nil then
+				self.flaskDisplayData.chargesMaxDelta = self.flaskDisplayData.chargesMax - flaskData.chargesMax
+			end
+			if self.flaskDisplayData.chargesUsed and flaskData.chargesUsed and self.flaskDisplayData.chargesUsedDelta == nil then
+				self.flaskDisplayData.chargesUsedDelta = self.flaskDisplayData.chargesUsed - flaskData.chargesUsed
+			end
+			if self.flaskDisplayData.durationScale and flaskData.duration then
+				flaskData.duration = round(flaskData.duration * self.flaskDisplayData.durationScale, 1)
+			end
+			if self.flaskDisplayData.chargesMaxDelta then
+				flaskData.chargesMax = flaskData.chargesMax + self.flaskDisplayData.chargesMaxDelta
+			end
+			if self.flaskDisplayData.chargesUsedDelta then
+				flaskData.chargesUsed = flaskData.chargesUsed + self.flaskDisplayData.chargesUsedDelta
+			end
+			if self.flaskDisplayData.currentCharges then
+				flaskData.currentCharges = m_min(self.flaskDisplayData.currentCharges, flaskData.chargesMax or self.flaskDisplayData.currentCharges)
+			end
+		end
 	elseif self.base.tincture then
 		local tinctureData = self.tinctureData
 		tinctureData.manaBurn = (self.base.tincture.manaBurn + 0.01) / (1 + calcLocal(modList, "TinctureManaBurnRate", "INC", 0) / 100) / (1 + calcLocal(modList, "TinctureManaBurnRate", "MORE", 0) / 100)
@@ -1691,7 +2761,10 @@ function ItemClass:BuildModList()
 			end
 		end
 	end
-	local function processModLine(modLine)
+	local modifierMagnitudeScalars = getModifierMagnitudeScalars({ self.explicitModLines, self.crucibleModLines }, function(modLine)
+		return self:CheckModLineVariant(modLine)
+	end)
+	local function processModLine(modLine, applyImplicitMagnitude)
 		if self:CheckModLineVariant(modLine) then
 			-- special section for variant over-ride of pre-modifier item parameters
 			if modLine.line:find("Requires Class") then
@@ -1699,22 +2772,30 @@ function ItemClass:BuildModList()
 			end
 			-- handle understood modifier variable properties
 			if not modLine.extra then
-				if modLine.range then
-					-- Check if line actually has a range
-					if modLine.line:find("%((%-?%d+%.?%d*)%-(%-?%d+%.?%d*)%)") then
-						local strippedModeLine = modLine.line:gsub("\n"," ")						
-						local catalystScalar = getCatalystScalar(self.catalyst, modLine.modTags, self.catalystQuality)
-						-- Put the modified value into the string
-						local line = itemLib.applyRange(strippedModeLine, modLine.range, catalystScalar)
-						-- Check if we can parse it before adding the mods
-						local list, extra = modLib.parseMod(line)
-						if list and not extra then
-							modLine.modList = list
+				local catalystScalar = getCatalystScalar(self.catalyst, modLine.modTags, self.catalystQuality)
+				local magnitudeScalar = modLine.unscalable and 1 or ((applyImplicitMagnitude and modifierMagnitudeScalars.implicit) or 1)
+				local unveiledScalar = (modLine.unscalable or not modLine.veiled) and 1 or modifierMagnitudeScalars.unveiled
+				local valueScalar = catalystScalar * magnitudeScalar * unveiledScalar
+				local hasRangedText = modLine.line:find("%((%-?%d+%.?%d*)%-(%-?%d+%.?%d*)%)") ~= nil
+				if hasRangedText or valueScalar ~= 1 then
+					local scaledLine = modLine.line:gsub("\n"," ")
+					if modLine.range and hasRangedText then
+						scaledLine = itemLib.applyRange(scaledLine, modLine.range, valueScalar)
+					else
+						scaledLine = itemLib.applyValueScalar(scaledLine, valueScalar)
+					end
+					-- Check if we can parse it before adding the mods
+					local list, extra = modLib.parseMod(scaledLine)
+					if list and not extra then
+						modLine.modList = list
+						modLine.extra = nil
+						modLine.valueScalar = valueScalar
+						if modLine.range and hasRangedText then
 							t_insert(self.rangeLineList, modLine)
 						end
 					end
 				end
-				for _, mod in ipairs(modLine.modList) do
+				for _, mod in ipairs(modLine.modList or { }) do
 					mod = modLib.setSource(mod, self.modSource)
 					baseList:AddMod(mod)
 				end
@@ -1725,22 +2806,22 @@ function ItemClass:BuildModList()
 		end
 	end
 	for _, modLine in ipairs(self.enchantModLines) do
-		processModLine(modLine)
+		processModLine(modLine, false)
 	end
 	for _, modLine in ipairs(self.scourgeModLines) do
-		processModLine(modLine)
+		processModLine(modLine, false)
 	end
 	for _, modLine in ipairs(self.classRequirementModLines) do
-		processModLine(modLine)
+		processModLine(modLine, false)
 	end
 	for _, modLine in ipairs(self.implicitModLines) do
-		processModLine(modLine)
+		processModLine(modLine, true)
 	end
 	for _, modLine in ipairs(self.explicitModLines) do
-		processModLine(modLine)
+		processModLine(modLine, false)
 	end
 	for _, modLine in ipairs(self.crucibleModLines) do
-		processModLine(modLine)
+		processModLine(modLine, false)
 	end
 	if self.name == "Tabula Rasa, Simple Robe" or self.name == "Skin of the Loyal, Simple Robe" or self.name == "Skin of the Lords, Simple Robe" or self.name == "The Apostate, Cabalist Regalia" then
 		-- Hack to remove the energy shield and base int requirement
