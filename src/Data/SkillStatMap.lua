@@ -295,6 +295,9 @@ return {
 ["skill_repeat_count"] = {
 	mod("RepeatCount", "BASE", nil, 0, 0, { type = "SkillType", skillType = SkillType.Multicastable }),
 },
+["disable_skill_repeats"] = {
+	flag("CannotRepeat"),
+},
 ["display_skill_minions_level_is_corpse_level"] = {
 	skill("minionLevelIsEnemyLevel", true),
 },
@@ -1970,6 +1973,12 @@ return {
 },
 ["base_number_of_skeletons_allowed"] = {
 	mod("ActiveSkeletonLimit", "BASE", nil),
+},
+["base_number_of_animated_weapons_allowed"] = {
+	mod("ActiveAnimatedWeaponLimit", "BASE", nil),
+},
+["base_number_of_support_ghosts_allowed"] = {
+	mod("ActivePhantasmLimit", "BASE", nil),
 },
 ["base_number_of_raging_spirits_allowed"] = {
 	mod("ActiveRagingSpiritLimit", "BASE", nil),
